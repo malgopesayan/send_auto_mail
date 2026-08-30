@@ -107,6 +107,17 @@ engineering roles.
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
+
+def sanitize_storage_filename(filename: str) -> str:
+    """Every resume is stored/attached under one clean, fixed name — e.g.
+    'Sayan_Malgope_Resume.pdf' — regardless of what the uploaded file was
+    called. Only the original extension is kept."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix not in RESUME_EXTENSIONS:
+        suffix = ".pdf"
+    base = re.sub(r"[^A-Za-z0-9]+", "_", CANDIDATE_NAME).strip("_") or "Resume"
+    return f"{base}_Resume{suffix}"
+
 EXTRACTION_PROMPT = f"""
 You are looking at a screenshot of a recruiter message, job posting, or
 LinkedIn DM. Do two things:
@@ -199,12 +210,18 @@ def get_current_resume_info(supabase: Client) -> dict | None:
 
 
 def get_current_resume_bytes(supabase: Client) -> tuple[str, bytes] | tuple[None, None]:
-    """Returns (filename, raw_bytes) for the current resume, or (None, None) if none uploaded."""
-    info = get_current_resume_info(supabase)
-    if not info:
+    """Returns (filename, raw_bytes) for the current resume, or (None, None) if none uploaded
+    (or if the resumes bucket isn't set up yet — this must never break sending mail)."""
+    try:
+        info = get_current_resume_info(supabase)
+        if not info:
+            return None, None
+        raw = supabase.storage.from_(SUPABASE_RESUME_BUCKET).download(info["name"])
+        return info["name"], raw
+    except Exception as exc:  # noqa: BLE001 - resume attach is best-effort, never fatal
+        print(f"⚠️  Couldn't fetch resume from '{SUPABASE_RESUME_BUCKET}' bucket, "
+              f"sending without an attachment: {exc}")
         return None, None
-    raw = supabase.storage.from_(SUPABASE_RESUME_BUCKET).download(info["name"])
-    return info["name"], raw
 
 
 def clear_resume_bucket(supabase: Client) -> None:
@@ -783,7 +800,13 @@ async def api_upload_screenshots(files: list[UploadFile] = File(...)):
 @app.get("/api/resume")
 def api_get_resume():
     supabase = get_supabase()
-    info = get_current_resume_info(supabase)
+    try:
+        info = get_current_resume_info(supabase)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Couldn't reach the '{SUPABASE_RESUME_BUCKET}' bucket — has it been created in Supabase Storage yet? ({exc})",
+        )
     return info or {}
 
 
@@ -794,23 +817,33 @@ async def api_upload_resume(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Resume must be a .pdf, .doc, or .docx file")
 
     content = await file.read()
-    mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    safe_name = sanitize_storage_filename(file.filename or "resume.pdf")
+    mime_type = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
 
     supabase = get_supabase()
-    # Only one resume is ever kept — clear whatever was there before uploading the new one.
-    clear_resume_bucket(supabase)
-    supabase.storage.from_(SUPABASE_RESUME_BUCKET).upload(
-        file.filename,
-        content,
-        file_options={"content-type": mime_type, "upsert": "true"},
-    )
-    return {"name": file.filename}
+    try:
+        # Only one resume is ever kept — clear whatever was there before uploading the new one.
+        clear_resume_bucket(supabase)
+        supabase.storage.from_(SUPABASE_RESUME_BUCKET).upload(
+            safe_name,
+            content,
+            file_options={"content-type": mime_type, "upsert": "true"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Couldn't upload to the '{SUPABASE_RESUME_BUCKET}' bucket — has it been created in Supabase Storage yet? ({exc})",
+        )
+    return {"name": safe_name}
 
 
 @app.delete("/api/resume")
 def api_delete_resume():
     supabase = get_supabase()
-    clear_resume_bucket(supabase)
+    try:
+        clear_resume_bucket(supabase)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Couldn't clear the resume bucket: {exc}")
     return {"status": "deleted"}
 
 
@@ -828,7 +861,10 @@ def api_send_job(job_id: int):
     rows = resp.data or []
     if not rows:
         raise HTTPException(status_code=404, detail="Job not found")
-    message = send_mail_for_job(supabase, rows[0])
+    try:
+        message = send_mail_for_job(supabase, rows[0])
+    except Exception as exc:  # noqa: BLE001 - never let this crash unhandled
+        raise HTTPException(status_code=500, detail=f"Failed to send: {exc}")
     return {"message": message}
 
 
