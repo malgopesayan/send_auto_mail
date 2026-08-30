@@ -29,12 +29,22 @@ class GmailService:
                 token.write(creds.to_json())
         return build("gmail", "v1", credentials=creds)
 
-    def send_mail(self, to_email, subject, body, attachment_path=None):
+    def send_mail(self, to_email, subject, body, attachment_path=None,
+                  attachment_bytes=None, attachment_filename=None):
         message = EmailMessage()
         message["To"] = to_email
         message["Subject"] = subject
         message.set_content(body)
-        if attachment_path:
+
+        if attachment_bytes is not None and attachment_filename:
+            # Attach in-memory bytes (e.g. a resume downloaded from Supabase Storage)
+            mime_type, _ = mimetypes.guess_type(attachment_filename)
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+            main_type, sub_type = mime_type.split("/", 1)
+            message.add_attachment(attachment_bytes, maintype=main_type, subtype=sub_type,
+                                    filename=attachment_filename)
+        elif attachment_path:
             mime_type, _ = mimetypes.guess_type(attachment_path)
             if mime_type is None:
                 mime_type = "application/octet-stream"
