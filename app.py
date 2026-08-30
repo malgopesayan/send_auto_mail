@@ -65,6 +65,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "screenshots")
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "job_applications")
+# Bucket used to store the candidate's resume that gets attached to every
+# outgoing application email. Only ever holds a single file — uploading a
+# new one replaces whatever was there before.
+SUPABASE_RESUME_BUCKET = os.environ.get("SUPABASE_RESUME_BUCKET", "resumes")
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.8-27b")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "llama-3.3-70b-versatile")
@@ -101,6 +105,7 @@ engineering roles.
 """.strip()
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
 EXTRACTION_PROMPT = f"""
 You are looking at a screenshot of a recruiter message, job posting, or
@@ -174,6 +179,39 @@ def get_gmail_service() -> GmailService:
     if _gmail_service is None:
         _gmail_service = GmailService()
     return _gmail_service
+
+
+# --------------------------------------------------------------------------
+# RESUME (single file, stored in its own Supabase Storage bucket, attached
+# to every outgoing application email)
+# --------------------------------------------------------------------------
+
+def get_current_resume_info(supabase: Client) -> dict | None:
+    """Returns {"name": ..., "updated_at": ...} for the current resume, or None."""
+    files = supabase.storage.from_(SUPABASE_RESUME_BUCKET).list()
+    files = [f for f in (files or []) if f.get("name") and not f["name"].startswith(".")]
+    if not files:
+        return None
+    # Only one resume is ever kept, but be defensive and take the most recent.
+    files.sort(key=lambda f: f.get("updated_at") or f.get("created_at") or "", reverse=True)
+    f = files[0]
+    return {"name": f["name"], "updated_at": f.get("updated_at") or f.get("created_at")}
+
+
+def get_current_resume_bytes(supabase: Client) -> tuple[str, bytes] | tuple[None, None]:
+    """Returns (filename, raw_bytes) for the current resume, or (None, None) if none uploaded."""
+    info = get_current_resume_info(supabase)
+    if not info:
+        return None, None
+    raw = supabase.storage.from_(SUPABASE_RESUME_BUCKET).download(info["name"])
+    return info["name"], raw
+
+
+def clear_resume_bucket(supabase: Client) -> None:
+    files = supabase.storage.from_(SUPABASE_RESUME_BUCKET).list()
+    names = [f["name"] for f in (files or []) if f.get("name") and not f["name"].startswith(".")]
+    if names:
+        supabase.storage.from_(SUPABASE_RESUME_BUCKET).remove(names)
 
 
 # --------------------------------------------------------------------------
@@ -413,6 +451,7 @@ def run_pipeline():
 # --------------------------------------------------------------------------
 
 def find_job_matches(supabase: Client, query: str) -> list[dict]:
+    """Used for sending mail — only considers jobs that haven't been sent yet."""
     query = query.strip().lower()
     resp = supabase.table(SUPABASE_TABLE).select("*").neq("email_status", "Sent").execute()
     rows = resp.data or []
@@ -426,15 +465,51 @@ def find_job_matches(supabase: Client, query: str) -> list[dict]:
     return matches
 
 
+def find_any_job(supabase: Client, query: str = "", job_id: int | None = None) -> list[dict]:
+    """General-purpose lookup across the WHOLE table (any status), for view/update/delete tools."""
+    if job_id is not None:
+        resp = supabase.table(SUPABASE_TABLE).select("*").eq("id", job_id).limit(1).execute()
+        return resp.data or []
+
+    query = (query or "").strip().lower()
+    resp = supabase.table(SUPABASE_TABLE).select("*").execute()
+    rows = resp.data or []
+    if not query:
+        return rows
+    return [
+        r for r in rows
+        if query in (r.get("company") or "").lower()
+        or query in (r.get("job_title") or "").lower()
+        or query in (r.get("recruiter_name") or "").lower()
+        or query in (r.get("recruiter_email") or "").lower()
+        or query in (r.get("location") or "").lower()
+        or query in (r.get("priority") or "").lower()
+        or query in (r.get("email_status") or "").lower()
+        or query in str(r.get("id"))
+    ]
+
+
+# Columns the chatbot is allowed to read/write on job_applications.
+EDITABLE_JOB_COLUMNS = {
+    "recruiter_email", "recruiter_name", "company", "job_title", "location",
+    "job_match_score", "priority", "email_subject", "email_body",
+    "email_status", "sent_date", "follow_up_date",
+}
+
+
 def send_mail_for_job(supabase: Client, row: dict) -> str:
     if not row.get("recruiter_email"):
         return f"'{row.get('company', 'that job')}' has no recruiter email on file, so I can't send it."
+
+    resume_filename, resume_bytes = get_current_resume_bytes(supabase)
 
     gmail = get_gmail_service()
     gmail.send_mail(
         to_email=row["recruiter_email"],
         subject=row.get("email_subject") or f"Application - {CANDIDATE_NAME}",
         body=row.get("email_body") or "",
+        attachment_bytes=resume_bytes,
+        attachment_filename=resume_filename,
     )
 
     today = date.today()
@@ -444,7 +519,10 @@ def send_mail_for_job(supabase: Client, row: dict) -> str:
         "follow_up_date": (today + timedelta(days=7)).isoformat(),
     }).eq("id", row["id"]).execute()
 
-    return f"Sent the application email to {row['recruiter_email']} for {row.get('job_title', 'the role')} at {row.get('company', 'that company')}, and marked it Sent."
+    resume_note = f" (resume attached: {resume_filename})" if resume_filename else " (no resume on file — sent without an attachment)"
+    return (f"Sent the application email to {row['recruiter_email']} for "
+            f"{row.get('job_title', 'the role')} at {row.get('company', 'that company')}, "
+            f"and marked it Sent.{resume_note}")
 
 
 CHAT_TOOLS = [
@@ -481,6 +559,88 @@ CHAT_TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_jobs",
+            "description": "Search or list rows from the job_applications table, across ALL statuses (sent or not). Use for any question about what jobs exist, e.g. 'show me jobs at TestCo', 'list high priority jobs', 'what's the status of the Google application'. Returns up to `limit` matching rows with all columns.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Free-text filter matched against company, job title, recruiter name/email, location, priority, email status, or id. Leave empty to list everything.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows to return. Defaults to 20.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job",
+            "description": "Get the full detail of one specific job row, including the full drafted email body. Use when the user wants to see everything about one job, e.g. 'show me the full email for the Infosys one'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Company, job title, recruiter name/email, or id to identify the job.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_job",
+            "description": (
+                "Edit one or more fields on a job row in job_applications. Use whenever the user asks to change, "
+                "correct, or update anything about a job — e.g. fix a recruiter's email, change the priority, "
+                "rewrite the email subject/body, change match score, or manually mark a job's email_status. "
+                "Editable columns: recruiter_email, recruiter_name, company, job_title, location, job_match_score "
+                "(0-100 integer), priority (High/Medium/Low), email_subject, email_body, email_status "
+                "(Not Sent/Sent), sent_date (YYYY-MM-DD), follow_up_date (YYYY-MM-DD)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Company, job title, recruiter name/email, or id to identify the job to update.",
+                    },
+                    "updates": {
+                        "type": "object",
+                        "description": "Object mapping column name -> new value. Only include the fields being changed.",
+                    },
+                },
+                "required": ["query", "updates"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_job",
+            "description": "Permanently delete a job row from job_applications. Use when the user asks to remove, delete, or discard a job entry. This cannot be undone, so only call it when the user's intent to delete is clear.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Company, job title, recruiter name/email, or id to identify the job to delete.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -510,16 +670,75 @@ def run_chat_tool(name: str, args: dict, supabase: Client) -> str:
         threading.Thread(target=run_pipeline, daemon=True).start()
         return "Started processing new screenshots. Watch the console panel for live progress."
 
+    if name == "list_jobs":
+        limit = args.get("limit") or 20
+        rows = find_any_job(supabase, args.get("query", ""))
+        rows = rows[: max(1, min(int(limit), 100))]
+        if not rows:
+            return "No jobs matched that."
+        summary = [
+            {
+                "id": r.get("id"),
+                "company": r.get("company"),
+                "job_title": r.get("job_title"),
+                "location": r.get("location"),
+                "priority": r.get("priority"),
+                "job_match_score": r.get("job_match_score"),
+                "email_status": r.get("email_status"),
+                "recruiter_email": r.get("recruiter_email"),
+            }
+            for r in rows
+        ]
+        return json.dumps(summary)
+
+    if name in ("get_job", "update_job", "delete_job"):
+        query = args.get("query", "")
+        job_id = None
+        if query.strip().isdigit():
+            job_id = int(query.strip())
+        matches = find_any_job(supabase, query="" if job_id is not None else query, job_id=job_id)
+        if not matches:
+            return f"I couldn't find any job matching '{query}'."
+        if len(matches) > 1:
+            options = ", ".join(f"#{m.get('id')} {m.get('company')} - {m.get('job_title')}" for m in matches[:8])
+            return f"That matches more than one job: {options}. Can you be more specific, or give the id?"
+        row = matches[0]
+
+        if name == "get_job":
+            return json.dumps(row)
+
+        if name == "update_job":
+            updates = args.get("updates") or {}
+            clean_updates = {k: v for k, v in updates.items() if k in EDITABLE_JOB_COLUMNS}
+            rejected = [k for k in updates if k not in EDITABLE_JOB_COLUMNS]
+            if not clean_updates:
+                return f"None of the fields you gave are editable. Editable fields: {', '.join(sorted(EDITABLE_JOB_COLUMNS))}."
+            supabase.table(SUPABASE_TABLE).update(clean_updates).eq("id", row["id"]).execute()
+            note = f" (ignored non-editable field(s): {', '.join(rejected)})" if rejected else ""
+            return (f"Updated job #{row['id']} ({row.get('company')} - {row.get('job_title')}): "
+                    f"set {clean_updates}.{note}")
+
+        if name == "delete_job":
+            supabase.table(SUPABASE_TABLE).delete().eq("id", row["id"]).execute()
+            return f"Deleted job #{row['id']} ({row.get('company')} - {row.get('job_title')})."
+
     return f"Unknown tool: {name}"
 
 
 CHAT_SYSTEM_PROMPT = f"""
 You are the assistant embedded in {CANDIDATE_NAME}'s job-application pipeline
-dashboard. You can look up jobs, report stats, kick off screenshot processing,
-and send application emails on the user's behalf via the available tools.
-Be concise and direct. When you send an email or start processing, confirm
-what happened in plain language. If a request is ambiguous (e.g. which job to
-email), ask a short clarifying question instead of guessing.
+dashboard. You have full read and write access to the job_applications table
+via your tools: you can list/search every job regardless of status, view a
+job's full detail (including the drafted email body), edit any editable field
+on a job, delete a job outright, report aggregate stats, kick off screenshot
+processing, and send application emails (with the candidate's resume
+auto-attached if one is on file) on the user's behalf.
+
+Be concise and direct. When you change something (send mail, edit a field,
+delete a row, start processing), confirm exactly what happened in plain
+language. If a request is ambiguous — which job to act on, or which field to
+change — ask one short clarifying question instead of guessing. Before
+deleting a job, only proceed if the user's intent is clearly a delete request.
 """
 
 
@@ -559,6 +778,40 @@ async def api_upload_screenshots(files: list[UploadFile] = File(...)):
             errors.append({"name": f.filename, "error": str(exc)})
 
     return {"uploaded": uploaded, "skipped": skipped, "errors": errors}
+
+
+@app.get("/api/resume")
+def api_get_resume():
+    supabase = get_supabase()
+    info = get_current_resume_info(supabase)
+    return info or {}
+
+
+@app.post("/api/resume/upload")
+async def api_upload_resume(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in RESUME_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Resume must be a .pdf, .doc, or .docx file")
+
+    content = await file.read()
+    mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+
+    supabase = get_supabase()
+    # Only one resume is ever kept — clear whatever was there before uploading the new one.
+    clear_resume_bucket(supabase)
+    supabase.storage.from_(SUPABASE_RESUME_BUCKET).upload(
+        file.filename,
+        content,
+        file_options={"content-type": mime_type, "upsert": "true"},
+    )
+    return {"name": file.filename}
+
+
+@app.delete("/api/resume")
+def api_delete_resume():
+    supabase = get_supabase()
+    clear_resume_bucket(supabase)
+    return {"status": "deleted"}
 
 
 @app.get("/api/jobs")
