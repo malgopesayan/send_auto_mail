@@ -367,6 +367,14 @@
     border: 1px solid var(--panel-border);
   }
   .msg.thinking { color: var(--text-muted); font-style: italic; }
+  .msg.bot strong { color: var(--text-primary); font-weight: 700; }
+  .msg.bot code {
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(255, 255, 255, 0.08);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
 
   #chat-input-row {
     display: flex;
@@ -517,7 +525,10 @@
   <section class="panel">
     <div class="panel-header">
       <h2>Pipeline Console</h2>
-      <button class="primary" id="run-btn">Run Pipeline</button>
+      <div style="display:flex; gap:8px;">
+        <button class="ghost" id="reindex-btn" title="Rebuild the chatbot's semantic knowledge base from every job + resume">Sync Knowledge Base</button>
+        <button class="primary" id="run-btn">Run Pipeline</button>
+      </div>
     </div>
     <div id="console">
       <div class="line muted">Waiting to run. Click "Run Pipeline" to process new screenshots from Supabase Storage.</div>
@@ -658,10 +669,20 @@ async function loadJobs() {
 }
 
 async function sendJob(id) {
-  const res = await fetch(`/api/jobs/${id}/send`, { method: 'POST' });
-  const data = await res.json();
-  appendConsoleLine(data.message || data.detail || 'Done.', res.ok ? 'success' : 'fail');
-  loadJobs();
+  try {
+    const res = await fetch(`/api/jobs/${id}/send`, { method: 'POST' });
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      data = { detail: await res.text().catch(() => 'Unknown error') };
+    }
+    appendConsoleLine(data.message || data.detail || 'Done.', res.ok ? 'success' : 'fail');
+  } catch (err) {
+    appendConsoleLine(`Send failed: ${err.message}`, 'fail');
+  } finally {
+    loadJobs();
+  }
 }
 
 function appendConsoleLine(text, cls) {
@@ -719,6 +740,27 @@ async function runPipeline() {
 }
 
 $('#run-btn').addEventListener('click', runPipeline);
+
+$('#reindex-btn').addEventListener('click', async () => {
+  const btn = $('#reindex-btn');
+  btn.disabled = true;
+  appendConsoleLine('Syncing knowledge base (embedding every job + the resume)...', 'muted');
+  try {
+    const res = await fetch('/api/knowledge/reindex-all', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Reindex failed');
+    let msg = `Knowledge base synced — ${data.jobs} job(s) indexed`;
+    msg += data.resume ? ', resume indexed.' : ', no resume on file.';
+    appendConsoleLine(msg, 'success');
+    if (data.errors && data.errors.length) {
+      data.errors.forEach(e => appendConsoleLine(`⚠️ ${e}`, 'warn'));
+    }
+  } catch (err) {
+    appendConsoleLine(`Knowledge base sync failed: ${err.message}`, 'fail');
+  } finally {
+    btn.disabled = false;
+  }
+});
 $('#refresh-btn').addEventListener('click', loadJobs);
 
 // --- Upload ---
@@ -849,6 +891,9 @@ async function uploadResume(file) {
 }
 
 async function removeResume() {
+  if (!confirm('Remove your resume? Application emails will send without an attachment until you upload a new one.')) {
+    return;
+  }
   try {
     await fetch('/api/resume', { method: 'DELETE' });
     appendConsoleLine('Resume removed. Application emails will send without an attachment.', 'warn');
@@ -890,10 +935,30 @@ $('#chat-close').addEventListener('click', () => {
   $('#chat-panel').classList.remove('open');
 });
 
+function renderInlineMarkdown(text) {
+  // Escape HTML first so we never inject anything the model/user typed as markup.
+  let safe = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  safe = safe
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/\n/g, '<br>');
+
+  return safe;
+}
+
 function appendChatMessage(role, text) {
   const el = document.createElement('div');
   el.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
-  el.textContent = text;
+  if (role === 'user') {
+    el.textContent = text;
+  } else {
+    el.innerHTML = renderInlineMarkdown(text);
+  }
   $('#chat-messages').appendChild(el);
   $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight;
   return el;
@@ -914,14 +979,24 @@ async function sendChatMessage() {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, history: chatHistory.slice(-10) }),
+      body: JSON.stringify({ message: text, history: chatHistory.slice(-40) }),
     });
-    const data = await res.json();
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      data = { detail: (await res.text().catch(() => '')) || 'Something went wrong.' };
+    }
     thinkingEl.remove();
-    appendChatMessage('bot', data.reply || data.detail || 'Something went wrong.');
-    chatHistory.push({ role: 'user', content: text });
-    chatHistory.push({ role: 'assistant', content: data.reply || '' });
-    loadJobs(); // in case the chatbot sent mail or started processing
+
+    if (!res.ok) {
+      appendChatMessage('bot', `⚠️ ${data.detail || 'Something went wrong.'}`);
+    } else {
+      appendChatMessage('bot', data.reply || 'Something went wrong.');
+      chatHistory.push({ role: 'user', content: text });
+      chatHistory.push({ role: 'assistant', content: data.reply || '' });
+      loadJobs(); // in case the chatbot sent mail, edited a job, or started processing
+    }
   } catch (err) {
     thinkingEl.remove();
     appendChatMessage('bot', `Error: ${err.message}`);
