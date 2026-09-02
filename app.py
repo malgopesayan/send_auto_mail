@@ -52,6 +52,12 @@ from pydantic import BaseModel
 from groq import Groq, RateLimitError, APIStatusError
 from supabase import create_client, Client
 
+from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import SupabaseVectorStore
+from pypdf import PdfReader
+import docx as docx_lib
+
 # Gmail — exact class provided by the user, unchanged.
 from gmail_service import GmailService
 
@@ -71,7 +77,18 @@ SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "job_applications")
 SUPABASE_RESUME_BUCKET = os.environ.get("SUPABASE_RESUME_BUCKET", "resumes")
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.8-27b")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "llama-3.3-70b-versatile")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "openai/gpt-oss-120b")
+
+# --- RAG / knowledge base (LangChain + Gemini embeddings + pgvector) ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# NOTE: gemini-embedding-2 has a known SDK quirk where passing a *list* of
+# strings in one call collapses to a single embedding. We only ever embed
+# one document at a time below, so this is safe either way. Switch this env
+# var to "models/gemini-embedding-001" if you want the older, more battle-
+# tested model instead.
+EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-2")
+EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "768"))
+KNOWLEDGE_TABLE = os.environ.get("KNOWLEDGE_TABLE", "documents")
 
 API_KEY_ENV_VARS = [
     "GROQ_API_KEY",
@@ -229,6 +246,152 @@ def clear_resume_bucket(supabase: Client) -> None:
     names = [f["name"] for f in (files or []) if f.get("name") and not f["name"].startswith(".")]
     if names:
         supabase.storage.from_(SUPABASE_RESUME_BUCKET).remove(names)
+
+
+# --------------------------------------------------------------------------
+# KNOWLEDGE BASE / RAG (LangChain + Gemini embeddings + Supabase pgvector)
+#
+# Covers every job_applications row + the candidate's resume text, so the
+# chatbot can semantically search "everything" instead of only exact-match
+# lookups. Indexing is automatic: jobs are (re)indexed on insert/update and
+# removed on delete; the resume is (re)indexed on upload.
+# --------------------------------------------------------------------------
+
+_embeddings = None
+
+
+def get_embeddings() -> GoogleGenerativeAIEmbeddings:
+    global _embeddings
+    if _embeddings is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY not set in .env — required for the knowledge-base / RAG chat feature.")
+        _embeddings = GoogleGenerativeAIEmbeddings(
+            model=EMBEDDING_MODEL,
+            google_api_key=GEMINI_API_KEY,
+            output_dimensionality=EMBEDDING_DIMENSIONS,
+        )
+    return _embeddings
+
+
+def get_vector_store(supabase: Client) -> SupabaseVectorStore:
+    return SupabaseVectorStore(
+        client=supabase,
+        embedding=get_embeddings(),
+        table_name=KNOWLEDGE_TABLE,
+        query_name="match_documents",
+    )
+
+
+def _delete_indexed_docs(supabase: Client, source_type: str, source_id: str | None = None) -> None:
+    q = supabase.table(KNOWLEDGE_TABLE).delete().eq("metadata->>source_type", source_type)
+    if source_id is not None:
+        q = q.eq("metadata->>source_id", source_id)
+    q.execute()
+
+
+def _job_document_text(job: dict) -> str:
+    return "\n".join([
+        f"Company: {job.get('company') or '—'}",
+        f"Job Title: {job.get('job_title') or '—'}",
+        f"Location: {job.get('location') or '—'}",
+        f"Recruiter: {job.get('recruiter_name') or '—'} <{job.get('recruiter_email') or '—'}>",
+        f"Priority: {job.get('priority') or '—'}",
+        f"Match Score: {job.get('job_match_score') or 0}",
+        f"Email Status: {job.get('email_status') or '—'}",
+        f"Email Subject: {job.get('email_subject') or '—'}",
+        f"Email Body: {job.get('email_body') or '—'}",
+    ])
+
+
+def index_job(supabase: Client, job: dict) -> None:
+    """Upsert one job's embedding in the knowledge base. Best-effort — a
+    failure here (e.g. GEMINI_API_KEY missing) must never break the caller."""
+    if not job or job.get("id") is None:
+        return
+    try:
+        job_id = str(job["id"])
+        _delete_indexed_docs(supabase, "job", job_id)
+        doc = Document(
+            page_content=_job_document_text(job),
+            metadata={
+                "source_type": "job",
+                "source_id": job_id,
+                "company": job.get("company") or "",
+                "job_title": job.get("job_title") or "",
+            },
+        )
+        get_vector_store(supabase).add_documents([doc])
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  Couldn't index job #{job.get('id')} into the knowledge base: {exc}")
+
+
+def delete_job_from_index(supabase: Client, job_id: int) -> None:
+    try:
+        _delete_indexed_docs(supabase, "job", str(job_id))
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  Couldn't remove job #{job_id} from the knowledge base: {exc}")
+
+
+def extract_resume_text(filename: str, content: bytes) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    try:
+        if suffix == ".pdf":
+            reader = PdfReader(BytesIO(content))
+            return "\n".join((page.extract_text() or "") for page in reader.pages)
+        if suffix == ".docx":
+            d = docx_lib.Document(BytesIO(content))
+            return "\n".join(p.text for p in d.paragraphs)
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  Couldn't extract text from resume ({filename}): {exc}")
+        return ""
+    # Legacy .doc (binary Word format) isn't parseable without extra system
+    # tools — skip text extraction for it. PDF/DOCX cover the common case.
+    return ""
+
+
+def index_resume(supabase: Client, filename: str, content: bytes) -> None:
+    try:
+        _delete_indexed_docs(supabase, "resume")
+        text = extract_resume_text(filename, content)
+        if not text.strip():
+            return
+        doc = Document(page_content=text, metadata={"source_type": "resume", "source_id": filename})
+        get_vector_store(supabase).add_documents([doc])
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  Couldn't index resume into the knowledge base: {exc}")
+
+
+def search_knowledge_base(supabase: Client, query: str, k: int = 6) -> list[Document]:
+    return get_vector_store(supabase).similarity_search(query, k=k)
+
+
+def reindex_all(supabase: Client) -> dict:
+    """Bulk (re)index everything — used for the initial backfill of jobs that
+    existed before the knowledge base was added, and as a manual fix-up."""
+    counts = {"jobs": 0, "resume": 0, "errors": []}
+
+    try:
+        supabase.table(KNOWLEDGE_TABLE).delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    except Exception as exc:  # noqa: BLE001
+        counts["errors"].append(f"clear existing index: {exc}")
+
+    resp = supabase.table(SUPABASE_TABLE).select("*").execute()
+    for job in resp.data or []:
+        try:
+            index_job(supabase, job)
+            counts["jobs"] += 1
+        except Exception as exc:  # noqa: BLE001
+            counts["errors"].append(f"job #{job.get('id')}: {exc}")
+
+    try:
+        filename, raw = get_current_resume_bytes(supabase)
+        if filename and raw:
+            index_resume(supabase, filename, raw)
+            counts["resume"] = 1
+    except Exception as exc:  # noqa: BLE001
+        counts["errors"].append(f"resume: {exc}")
+
+    return counts
 
 
 # --------------------------------------------------------------------------
@@ -430,13 +593,16 @@ def run_pipeline():
             }
 
             try:
-                supabase.table(SUPABASE_TABLE).insert(row).execute()
+                insert_resp = supabase.table(SUPABASE_TABLE).insert(row).execute()
             except Exception as exc:  # noqa: BLE001
                 log(f"[{idx}/{total}] ❌ {name}: extracted fine, but couldn't save to the table "
                     f"({exc}). Left in the bucket so nothing is lost.")
                 failed += 1
                 pipeline_log_queue.put({"type": "progress", "idx": idx, "total": total, "status": "failed", "name": name})
                 continue
+
+            inserted_row = (insert_resp.data or [{}])[0]
+            index_job(supabase, {**row, "id": inserted_row.get("id")})
 
             try:
                 supabase.storage.from_(SUPABASE_BUCKET).remove([name])
@@ -530,11 +696,13 @@ def send_mail_for_job(supabase: Client, row: dict) -> str:
     )
 
     today = date.today()
-    supabase.table(SUPABASE_TABLE).update({
+    updates = {
         "email_status": "Sent",
         "sent_date": today.isoformat(),
         "follow_up_date": (today + timedelta(days=7)).isoformat(),
-    }).eq("id", row["id"]).execute()
+    }
+    supabase.table(SUPABASE_TABLE).update(updates).eq("id", row["id"]).execute()
+    index_job(supabase, {**row, **updates})
 
     resume_note = f" (resume attached: {resume_filename})" if resume_filename else " (no resume on file — sent without an attachment)"
     return (f"Sent the application email to {row['recruiter_email']} for "
@@ -658,6 +826,30 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": (
+                "Semantic search across the FULL knowledge base: every job application "
+                "(company, title, location, recruiter, priority, match score, status, "
+                "and the full drafted email) AND the candidate's resume text. Use this "
+                "for open-ended, fuzzy, or 'find similar' questions a simple keyword "
+                "lookup can't answer — e.g. 'which applications are for backend/Python "
+                "roles', 'does my resume mention AWS', 'summarize my high-priority "
+                "applications', 'find recruiters who mentioned urgent hiring'. Prefer "
+                "list_jobs/get_job for exact lookups by name; use this for anything "
+                "broader or content-based, including anything about the resume."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The question or topic to search for."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -672,14 +864,29 @@ def run_chat_tool(name: str, args: dict, supabase: Client) -> str:
         return send_mail_for_job(supabase, matches[0])
 
     if name == "get_stats":
-        resp = supabase.table(SUPABASE_TABLE).select("priority,email_status").execute()
+        resp = supabase.table(SUPABASE_TABLE).select("priority,email_status,sent_date").execute()
         rows = resp.data or []
         by_priority = {}
         by_status = {}
+        today_str = date.today().isoformat()
+        week_ago_str = (date.today() - timedelta(days=7)).isoformat()
+        sent_today = 0
+        sent_this_week = 0
         for r in rows:
             by_priority[r.get("priority") or "Unknown"] = by_priority.get(r.get("priority") or "Unknown", 0) + 1
             by_status[r.get("email_status") or "Unknown"] = by_status.get(r.get("email_status") or "Unknown", 0) + 1
-        return json.dumps({"total": len(rows), "by_priority": by_priority, "by_status": by_status})
+            sent_date = r.get("sent_date")
+            if sent_date == today_str:
+                sent_today += 1
+            if sent_date and sent_date >= week_ago_str:
+                sent_this_week += 1
+        return json.dumps({
+            "total": len(rows),
+            "by_priority": by_priority,
+            "by_status": by_status,
+            "sent_today": sent_today,
+            "sent_last_7_days": sent_this_week,
+        })
 
     if name == "start_processing":
         if pipeline_state["running"]:
@@ -731,13 +938,30 @@ def run_chat_tool(name: str, args: dict, supabase: Client) -> str:
             if not clean_updates:
                 return f"None of the fields you gave are editable. Editable fields: {', '.join(sorted(EDITABLE_JOB_COLUMNS))}."
             supabase.table(SUPABASE_TABLE).update(clean_updates).eq("id", row["id"]).execute()
+            index_job(supabase, {**row, **clean_updates})
             note = f" (ignored non-editable field(s): {', '.join(rejected)})" if rejected else ""
             return (f"Updated job #{row['id']} ({row.get('company')} - {row.get('job_title')}): "
                     f"set {clean_updates}.{note}")
 
         if name == "delete_job":
             supabase.table(SUPABASE_TABLE).delete().eq("id", row["id"]).execute()
+            delete_job_from_index(supabase, row["id"])
             return f"Deleted job #{row['id']} ({row.get('company')} - {row.get('job_title')})."
+
+    if name == "search_knowledge":
+        query = args.get("query", "")
+        try:
+            docs = search_knowledge_base(supabase, query, k=6)
+        except Exception as exc:  # noqa: BLE001
+            return (f"Knowledge-base search failed ({exc}). Make sure GEMINI_API_KEY is set "
+                    f"and the 'documents' table / match_documents function exist in Supabase.")
+        if not docs:
+            return "Nothing relevant found in the knowledge base."
+        results = [
+            {"source": d.metadata.get("source_type"), "ref": d.metadata.get("source_id"), "content": d.page_content}
+            for d in docs
+        ]
+        return json.dumps(results)
 
     return f"Unknown tool: {name}"
 
@@ -750,6 +974,17 @@ job's full detail (including the drafted email body), edit any editable field
 on a job, delete a job outright, report aggregate stats, kick off screenshot
 processing, and send application emails (with the candidate's resume
 auto-attached if one is on file) on the user's behalf.
+
+You also have search_knowledge — a semantic (RAG) search over EVERYTHING:
+every job's full content and the candidate's resume text. Use list_jobs/
+get_job for exact lookups by name or id, and search_knowledge for open-ended,
+fuzzy, "find similar", or resume-content questions that keyword matching
+can't answer well.
+
+For any question about counts — how many total, how many sent, how many
+today/this week, breakdowns by priority or status — always use get_stats
+first; it already includes sent_today and sent_last_7_days. Only fall back
+to list_jobs if get_stats genuinely doesn't cover what was asked.
 
 Be concise and direct. When you change something (send mail, edit a field,
 delete a row, start processing), confirm exactly what happened in plain
@@ -834,6 +1069,7 @@ async def api_upload_resume(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Couldn't upload to the '{SUPABASE_RESUME_BUCKET}' bucket — has it been created in Supabase Storage yet? ({exc})",
         )
+    index_resume(supabase, safe_name, content)
     return {"name": safe_name}
 
 
@@ -844,7 +1080,18 @@ def api_delete_resume():
         clear_resume_bucket(supabase)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Couldn't clear the resume bucket: {exc}")
+    _delete_indexed_docs(supabase, "resume")
     return {"status": "deleted"}
+
+
+@app.post("/api/knowledge/reindex-all")
+def api_reindex_all():
+    supabase = get_supabase()
+    try:
+        counts = reindex_all(supabase)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {exc}")
+    return counts
 
 
 @app.get("/api/jobs")
@@ -908,35 +1155,42 @@ def api_chat(req: ChatRequest):
     messages.extend(req.history)
     messages.append({"role": "user", "content": req.message})
 
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        tools=CHAT_TOOLS,
-        tool_choice="auto",
-        temperature=0.4,
-    )
+    try:
+        reply = None
+        for _ in range(5):  # hard cap so a confused model can't loop forever
+            response = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=messages,
+                tools=CHAT_TOOLS,
+                tool_choice="auto",
+                temperature=0.4,
+            )
+            choice = response.choices[0].message
 
-    choice = response.choices[0].message
+            if not choice.tool_calls:
+                reply = choice.content
+                break
 
-    if choice.tool_calls:
-        messages.append(choice.model_dump())
-        for tool_call in choice.tool_calls:
-            args = json.loads(tool_call.function.arguments or "{}")
-            result = run_chat_tool(tool_call.function.name, args, supabase)
             messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
+                "role": "assistant",
+                "content": choice.content,
+                "tool_calls": [tc.model_dump() for tc in choice.tool_calls],
             })
-
-        follow_up = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            temperature=0.4,
-        )
-        reply = follow_up.choices[0].message.content
-    else:
-        reply = choice.content
+            for tool_call in choice.tool_calls:
+                try:
+                    args = json.loads(tool_call.function.arguments or "{}")
+                    result = run_chat_tool(tool_call.function.name, args, supabase)
+                except Exception as tool_exc:  # noqa: BLE001 - one bad tool call shouldn't crash the whole reply
+                    result = f"That action failed: {tool_exc}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+        else:
+            reply = "That took more steps than expected — could you rephrase or narrow the question?"
+    except Exception as exc:  # noqa: BLE001 - never let this crash unhandled
+        raise HTTPException(status_code=500, detail=f"Chat failed: {exc}")
 
     return {"reply": reply}
 
