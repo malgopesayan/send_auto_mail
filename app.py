@@ -77,7 +77,7 @@ SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "job_applications")
 SUPABASE_RESUME_BUCKET = os.environ.get("SUPABASE_RESUME_BUCKET", "resumes")
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.8-27b")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "openai/gpt-oss-120b")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen/qwen3.8-27b")
 
 # --- RAG / knowledge base (LangChain + Gemini embeddings + pgvector) ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
