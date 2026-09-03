@@ -813,14 +813,26 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "delete_job",
-            "description": "Permanently delete a job row from job_applications. Use when the user asks to remove, delete, or discard a job entry. This cannot be undone, so only call it when the user's intent to delete is clear.",
+            "description": (
+                "Permanently delete a job row from job_applications. This is a TWO-STEP tool: "
+                "1) First call it WITHOUT confirm (or confirm=false) to look up the job — you will "
+                "get back its full details and must show them to the user and explicitly ask 'are "
+                "you sure you want to delete this?'. 2) Only call it again WITH confirm=true after "
+                "the user has clearly said yes in their next message. Never set confirm=true on the "
+                "first call, even if the user's original request sounded certain — always get an "
+                "explicit yes after seeing which job it is. This cannot be undone."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "Company, job title, recruiter name/email, or id to identify the job to delete.",
-                    }
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to actually delete. Leave false/omitted for the initial lookup-and-confirm step.",
+                    },
                 },
                 "required": ["query"],
             },
@@ -944,6 +956,11 @@ def run_chat_tool(name: str, args: dict, supabase: Client) -> str:
                     f"set {clean_updates}.{note}")
 
         if name == "delete_job":
+            if args.get("confirm") is not True:
+                return (f"Found job #{row['id']}: {row.get('company')} - {row.get('job_title')} "
+                        f"({row.get('recruiter_email') or 'no email on file'}, status: {row.get('email_status')}). "
+                        f"This is not deleted yet — ask the user to confirm, then call delete_job again "
+                        f"with confirm=true only if they say yes.")
             supabase.table(SUPABASE_TABLE).delete().eq("id", row["id"]).execute()
             delete_job_from_index(supabase, row["id"])
             return f"Deleted job #{row['id']} ({row.get('company')} - {row.get('job_title')})."
@@ -989,8 +1006,14 @@ to list_jobs if get_stats genuinely doesn't cover what was asked.
 Be concise and direct. When you change something (send mail, edit a field,
 delete a row, start processing), confirm exactly what happened in plain
 language. If a request is ambiguous — which job to act on, or which field to
-change — ask one short clarifying question instead of guessing. Before
-deleting a job, only proceed if the user's intent is clearly a delete request.
+change — ask one short clarifying question instead of guessing.
+
+DELETING IS ALWAYS TWO STEPS: never call delete_job with confirm=true on the
+first attempt, no matter how sure the user sounds. First look the job up
+(confirm omitted/false), show the user exactly which job you found, and ask
+them to confirm. Only call delete_job again with confirm=true after they
+clearly say yes in their next message. If they say no or don't confirm, don't
+delete anything.
 """
 
 
