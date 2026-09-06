@@ -653,14 +653,35 @@
 
   <section class="panel">
     <div class="panel-header">
+      <h2>LinkedIn Search Keywords</h2>
+      <span id="keywords-updated" style="font-size:12px; color:var(--text-muted);"></span>
+    </div>
+    <div style="padding: 18px;">
+      <p style="margin:0 0 10px; font-size:12.5px; color:var(--text-muted);">
+        Auto-extracted from your resume as full LinkedIn search strings (role + hiring intent, e.g. "AI Engineer Hiring") so results land on real recruiter posts, not generic matches. Edit anytime, one phrase per line.
+      </p>
+      <textarea id="keywords-textarea" rows="5" placeholder="e.g.&#10;AI Engineer Hiring&#10;Hiring Python Developer&#10;We're hiring a Backend Engineer&#10;Looking for a FastAPI Developer" style="
+        width:100%; resize:vertical; background:#0D1013; color:var(--text-primary);
+        border:1px solid var(--panel-border); border-radius:8px; padding:10px 12px;
+        font-family:'JetBrains Mono', monospace; font-size:13px; line-height:1.6;"></textarea>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:10px;">
+        <button class="ghost" id="regen-keywords-btn" title="Re-generate from the current resume">Regenerate from Resume</button>
+        <button class="primary" id="save-keywords-btn">Save</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-header">
       <h2>Pipeline Console</h2>
-      <div style="display:flex; gap:8px;">
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button class="ghost" id="reindex-btn" title="Rebuild the chatbot's semantic knowledge base from every job + resume">Sync Knowledge Base</button>
+        <button class="ghost" id="linkedin-search-btn" title="Search LinkedIn for fresh job posts matching your keywords">Search LinkedIn Jobs</button>
         <button class="primary" id="run-btn">Run Pipeline</button>
       </div>
     </div>
     <div id="console">
-      <div class="line muted">Waiting to run. Click "Run Pipeline" to process new screenshots from Supabase Storage.</div>
+      <div class="line muted">Waiting to run. Click "Run Pipeline" to process new screenshots, or "Search LinkedIn Jobs" to find fresh postings.</div>
     </div>
   </section>
 
@@ -988,6 +1009,120 @@ $('#reindex-btn').addEventListener('click', async () => {
 });
 $('#refresh-btn').addEventListener('click', loadJobs);
 
+// --- Search keywords (resume-derived, editable) ---
+async function loadKeywords() {
+  try {
+    const res = await fetch('/api/keywords');
+    const data = await res.json();
+    $('#keywords-textarea').value = (data.keywords || []).join('\n');
+    $('#keywords-updated').textContent = data.updated_at
+      ? `Updated ${new Date(data.updated_at).toLocaleString()}` : '';
+  } catch (err) {
+    appendConsoleLine(`Couldn't load keywords: ${err.message}`, 'fail');
+  }
+}
+
+function keywordsFromTextarea() {
+  return $('#keywords-textarea').value
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+$('#save-keywords-btn').addEventListener('click', async () => {
+  const keywords = keywordsFromTextarea();
+  if (!keywords.length) {
+    appendConsoleLine('Add at least one keyword before saving.', 'warn');
+    return;
+  }
+  const btn = $('#save-keywords-btn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/keywords', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keywords }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Save failed');
+    appendConsoleLine(`Saved ${data.keywords.length} search keyword(s).`, 'success');
+    $('#keywords-updated').textContent = data.updated_at
+      ? `Updated ${new Date(data.updated_at).toLocaleString()}` : '';
+  } catch (err) {
+    appendConsoleLine(`Couldn't save keywords: ${err.message}`, 'fail');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#regen-keywords-btn').addEventListener('click', async () => {
+  const btn = $('#regen-keywords-btn');
+  btn.disabled = true;
+  appendConsoleLine('Re-extracting search keywords from the current resume...', 'muted');
+  try {
+    const res = await fetch('/api/keywords/regenerate', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Regenerate failed');
+    $('#keywords-textarea').value = (data.keywords || []).join('\n');
+    $('#keywords-updated').textContent = data.updated_at
+      ? `Updated ${new Date(data.updated_at).toLocaleString()}` : '';
+    appendConsoleLine(`Regenerated ${data.keywords.length} keyword(s) from the resume.`, 'success');
+  } catch (err) {
+    appendConsoleLine(`Couldn't regenerate keywords: ${err.message}`, 'fail');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+loadKeywords();
+
+// --- LinkedIn job search ---
+async function runLinkedinSearch() {
+  const btn = $('#linkedin-search-btn');
+  btn.disabled = true;
+  setRunning(true);
+  $('#console').innerHTML = '';
+  appendConsoleLine('Searching LinkedIn for fresh job posts...', 'muted');
+
+  const startRes = await fetch('/api/linkedin/search/start', { method: 'POST' });
+  const startData = await startRes.json().catch(() => ({}));
+  if (!startRes.ok) {
+    appendConsoleLine(`Couldn't start search: ${startData.detail || 'unknown error'}`, 'fail');
+    btn.disabled = false;
+    setRunning(false);
+    return;
+  }
+  if (startData.status === 'already_running') {
+    appendConsoleLine('A LinkedIn search is already running.', 'warn');
+  }
+
+  const evtSource = new EventSource('/api/linkedin/search/stream');
+  evtSource.onmessage = (event) => {
+    const item = JSON.parse(event.data);
+    if (item.type === 'start') {
+      appendConsoleLine(`Found ${item.total} fresh post(s) to check.`, 'muted');
+    } else if (item.type === 'log') {
+      const cls = item.message.includes('❌') ? 'fail' : item.message.includes('⚠️') ? 'warn' : 'muted';
+      appendConsoleLine(item.message, cls);
+    } else if (item.type === 'progress') {
+      loadJobs();
+    } else if (item.type === 'done') {
+      appendConsoleLine(`Finished — ${item.added} new job(s) added out of ${item.found} checked.`, 'muted');
+      setRunning(false);
+      btn.disabled = false;
+      loadJobs();
+      evtSource.close();
+    }
+  };
+  evtSource.onerror = () => {
+    evtSource.close();
+    setRunning(false);
+    btn.disabled = false;
+  };
+}
+
+$('#linkedin-search-btn').addEventListener('click', runLinkedinSearch);
+
 // --- Upload ---
 let pendingFiles = [];
 
@@ -1106,7 +1241,11 @@ async function uploadResume(file) {
     }
     const data = await res.json();
     appendConsoleLine(`Resume set to ${data.name} — it'll be attached to every application email from now on.`, 'success');
+    if (data.keywords && data.keywords.length) {
+      appendConsoleLine(`Auto-generated ${data.keywords.length} LinkedIn search keyword(s) from the resume.`, 'success');
+    }
     loadResume();
+    loadKeywords();
   } catch (err) {
     appendConsoleLine(`Resume upload failed: ${err.message}`, 'fail');
     loadResume();
@@ -1204,7 +1343,7 @@ async function sendChatMessage() {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, history: chatHistory.slice(-12) }),
+      body: JSON.stringify({ message: text, history: chatHistory.slice(-6) }),
     });
     let data;
     try {
