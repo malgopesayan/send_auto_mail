@@ -40,8 +40,9 @@ import mimetypes
 import threading
 from io import BytesIO
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
+import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -90,6 +91,23 @@ EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "models/gemini-embedd
 EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "768"))
 KNOWLEDGE_TABLE = os.environ.get("KNOWLEDGE_TABLE", "documents")
 
+# --- LinkedIn job search (HarvestAPI) + resume-derived search keywords ---
+HARVESTAPI_KEY = os.environ.get("HARVESTAPI_KEY")
+HARVESTAPI_BASE = "https://api.harvestapi.io"
+SEARCH_SETTINGS_TABLE = os.environ.get("SEARCH_SETTINGS_TABLE", "search_settings")
+# How fresh a LinkedIn post must be to be considered. Postings older than this
+# are skipped — a "4-5 day old" post is treated as stale.
+LINKEDIN_MAX_POST_AGE_DAYS = int(os.environ.get("LINKEDIN_MAX_POST_AGE_DAYS", "5"))
+# Many LinkedIn "job posts" are actually third-party aggregator/bot accounts
+# (e.g. "RemoteYeah", "JobKash", "Singapore Jobs") reposting listings with no
+# real way to reach anyone — not a genuine opening. When true, only postings
+# where a real contact email was found AND the post reads as a direct listing
+# from the actual hiring company/recruiter (not a repost) are saved.
+LINKEDIN_REQUIRE_GENUINE_CONTACT = os.environ.get("LINKEDIN_REQUIRE_GENUINE_CONTACT", "true").lower() != "false"
+# HarvestAPI's own postedLimit filter (applied server-side): '24h' | 'week' | 'month'.
+# We ask for 'week' and then post-filter precisely by LINKEDIN_MAX_POST_AGE_DAYS.
+LINKEDIN_POSTED_LIMIT = "week"
+
 API_KEY_ENV_VARS = [
     "GROQ_API_KEY",
     "GROQ_API_KEY1",
@@ -101,6 +119,15 @@ API_KEY_ENV_VARS = [
 RETRY_BACKOFF_SECONDS = 3
 MAX_IMAGE_DIMENSION = 1568
 CROP_WHITESPACE_MARGINS = True
+
+# The Groq free/on-demand tier for small models has a very low tokens-per-minute
+# budget (as low as 7000 input / 1000 output). Tool results (list_jobs,
+# search_knowledge, etc.) are hard-truncated, chat history is kept short, and
+# every chat completion request explicitly caps its own output tokens at this
+# value, so one chat turn can never blow the output-token-per-minute budget.
+CHAT_MAX_OUTPUT_TOKENS = 1000
+TOOL_RESULT_CHAR_LIMIT = 1200
+CHAT_HISTORY_TURNS = 6  # messages (not pairs) kept from the frontend-provided history
 
 CANDIDATE_NAME = "Sayan Malgope"
 CANDIDATE_EMAIL = "malgopesayan19@gmail.com"
@@ -246,6 +273,104 @@ def clear_resume_bucket(supabase: Client) -> None:
     names = [f["name"] for f in (files or []) if f.get("name") and not f["name"].startswith(".")]
     if names:
         supabase.storage.from_(SUPABASE_RESUME_BUCKET).remove(names)
+
+
+# --------------------------------------------------------------------------
+# SEARCH KEYWORDS — extracted from the resume by the model, but always
+# manually editable afterward (via /api/keywords or the chatbot). Stored as
+# a single row in `search_settings` so edits persist across restarts.
+# --------------------------------------------------------------------------
+
+KEYWORD_EXTRACTION_PROMPT_TEMPLATE = """
+Read the resume text below and identify the 3-6 job titles/roles this
+candidate is a strong fit for (e.g. "Python Developer", "AI Engineer",
+"Backend Engineer").
+
+For each role, produce 2-3 FULL search strings — not bare keywords — that
+someone would actually type into LinkedIn's post search to find recruiters
+or companies actively posting about that opening RIGHT NOW. Combine the role
+with a hiring-intent phrase, varying the pattern, e.g.:
+  "AI Engineer Hiring"
+  "Hiring AI Engineer"
+  "We're hiring a Python Developer"
+  "Backend Engineer job opening"
+  "Looking for a FastAPI Developer"
+  "Urgently hiring Full Stack Developer"
+
+Also include 2-4 pure skill/tech search strings paired with "hiring" or
+"job" the same way (e.g. "LangChain Developer wanted", "Hiring for RAG
+pipeline experience") rather than bare skill words alone — a lone skill like
+"FastAPI" matches almost every post and isn't useful as a search string.
+
+Rules: 10-16 total search strings, each a natural phrase of 2-6 words (not
+single words), no duplicates, no generic filler like "hard worker".
+
+Return ONLY a JSON object, no markdown fences, no commentary:
+{{"keywords": ["...", "...", ...]}}
+
+Resume text:
+\"\"\"{resume_text}\"\"\"
+"""
+
+
+def get_search_keywords(supabase: Client) -> dict:
+    """Returns {"keywords": [...], "updated_at": ...}. Empty list if never set."""
+    resp = supabase.table(SEARCH_SETTINGS_TABLE).select("*").eq("id", 1).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return {"keywords": [], "updated_at": None}
+    row = rows[0]
+    return {"keywords": row.get("keywords") or [], "updated_at": row.get("updated_at")}
+
+
+def save_search_keywords(supabase: Client, keywords: list[str]) -> dict:
+    clean = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
+    # de-dupe, preserve order
+    seen = set()
+    deduped = []
+    for k in clean:
+        low = k.lower()
+        if low not in seen:
+            seen.add(low)
+            deduped.append(k)
+    supabase.table(SEARCH_SETTINGS_TABLE).upsert({"id": 1, "keywords": deduped}).execute()
+    return get_search_keywords(supabase)
+
+
+def extract_keywords_from_resume_text(resume_text: str) -> list[str]:
+    groq_keys = load_groq_keys()
+    if not groq_keys or not resume_text.strip():
+        return []
+    client = Groq(api_key=groq_keys[0])
+    prompt = KEYWORD_EXTRACTION_PROMPT_TEMPLATE.format(resume_text=resume_text[:6000])
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_completion_tokens=500,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or "{}"
+        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(cleaned)
+        return [k for k in (data.get("keywords") or []) if isinstance(k, str) and k.strip()]
+    except Exception as exc:  # noqa: BLE001 - keyword extraction is best-effort
+        print(f"⚠️  Couldn't extract keywords from resume: {exc}")
+        return []
+
+
+def regenerate_keywords_from_current_resume(supabase: Client) -> dict:
+    filename, raw = get_current_resume_bytes(supabase)
+    if not filename or not raw:
+        raise RuntimeError("No resume on file to extract keywords from.")
+    text = extract_resume_text(filename, raw)
+    if not text.strip():
+        raise RuntimeError(f"Couldn't extract readable text from {filename}.")
+    keywords = extract_keywords_from_resume_text(text)
+    if not keywords:
+        raise RuntimeError("The model didn't return any keywords — try again or edit keywords manually.")
+    return save_search_keywords(supabase, keywords)
 
 
 # --------------------------------------------------------------------------
@@ -518,6 +643,291 @@ def extract_with_retries(clients: list[Groq], raw_bytes: bytes, log) -> tuple[di
 
 
 # --------------------------------------------------------------------------
+# LINKEDIN JOB SEARCH (HarvestAPI) — search by resume-derived keywords, keep
+# only posts from the last LINKEDIN_MAX_POST_AGE_DAYS days, extract job
+# fields + draft an email from the post text (no screenshot involved).
+# --------------------------------------------------------------------------
+
+LINKEDIN_EXTRACTION_PROMPT_TEMPLATE = f"""
+You are looking at the text of a LinkedIn post, which may or may not be a
+genuine job posting / recruiter outreach.
+
+1. First decide if this is actually a job posting or recruiter outreach
+   (not just someone commenting on hiring in general, a news article, etc).
+2. Then decide if it is a DIRECT listing — posted by the actual hiring
+   company, an employee of that company, or a recruiter working the role
+   themselves — as opposed to a third-party job-aggregator or bot account
+   (e.g. names like "RemoteYeah", "JobKash", "Singapore Jobs", generic
+   "XYZ Jobs" pages, or accounts that just repost listings scraped from
+   elsewhere with no personal involvement in the hiring). Aggregator/bot
+   reposts are NOT direct listings even if the underlying job looks real.
+3. If it is a genuine, direct listing, extract job/recruiter details and
+   draft a short, personalized application email for the candidate below,
+   tailored to this specific post.
+
+Return ONLY a JSON object (no markdown fences, no commentary):
+
+{{{{
+  "is_job_post": true or false,
+  "is_direct_listing": true or false,
+  "recruiter_email": "an email address ONLY if one is actually visible verbatim in the post text — never guess, invent, or infer one from a name/company. Empty string if none is shown.",
+  "recruiter_name": "the post author's name, else empty string",
+  "company": "company name if identifiable, else empty string",
+  "job_title": "job title / role if identifiable, else empty string",
+  "location": "job location if mentioned, else empty string",
+  "job_match_score": integer 0-100 rating how well this role matches the
+      candidate profile below,
+  "priority": one of "High", "Medium", "Low",
+  "email_subject": "a short, specific subject line for the application email,
+      e.g. 'Application for <Job Title> - {CANDIDATE_NAME}'",
+  "email_body": "a concise (roughly 120-180 word) plain-text application
+      email body, addressed to the recruiter by name if known. Reference the
+      specific job title/company from this post. Highlight 2-3 of the
+      candidate's most relevant skills for THIS role. End with a polite call
+      to action and sign off with the candidate's name and contact details
+      below. Plain text only, no markdown."
+}}}}
+
+Candidate profile to match against and to draft the email from:
+\"\"\"{TARGET_PROFILE}\"\"\"
+
+Candidate contact details to sign the email with:
+Name: {CANDIDATE_NAME}
+Email: {CANDIDATE_EMAIL}
+Phone: {CANDIDATE_PHONE}
+LinkedIn: {CANDIDATE_LINKEDIN}
+GitHub: {CANDIDATE_GITHUB}
+
+If this is not a genuine, direct job post — including aggregator/bot
+reposts, or ones with no real contact info — set is_job_post and/or
+is_direct_listing to false and leave the other fields as empty strings / 0.
+Don't try to force a match or invent contact details.
+
+LinkedIn post text:
+\"\"\"{{post_text}}\"\"\"
+"""
+
+
+def harvestapi_search_posts(query: str, posted_limit: str = LINKEDIN_POSTED_LIMIT) -> list[dict]:
+    if not HARVESTAPI_KEY:
+        raise RuntimeError("HARVESTAPI_KEY not set in .env — required for LinkedIn job search.")
+    resp = requests.get(
+        f"{HARVESTAPI_BASE}/linkedin/post-search",
+        params={
+            "search": query,
+            "postedLimit": posted_limit,
+            "sortBy": "date",
+            "page": 1,
+        },
+        headers={"X-API-Key": HARVESTAPI_KEY},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("elements", [])
+
+
+def _post_posted_datetime(post: dict) -> datetime | None:
+    ts = ((post.get("postedAt") or {}).get("timestamp"))
+    if not ts:
+        return None
+    # HarvestAPI timestamps are milliseconds since epoch; be defensive in
+    # case a given post ever comes back in seconds instead.
+    if ts > 10_000_000_000:
+        ts = ts / 1000
+    try:
+        return datetime.fromtimestamp(ts)
+    except (ValueError, OSError):
+        return None
+
+
+def is_recent_post(post: dict, max_age_days: int = LINKEDIN_MAX_POST_AGE_DAYS) -> bool:
+    posted_dt = _post_posted_datetime(post)
+    if posted_dt is None:
+        return False
+    return (datetime.now() - posted_dt).days <= max_age_days
+
+
+def extract_fields_from_linkedin_post(client: Groq, post_text: str) -> dict:
+    prompt = LINKEDIN_EXTRACTION_PROMPT_TEMPLATE.format(post_text=post_text[:4000])
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_completion_tokens=1024,
+        response_format={"type": "json_object"},
+    )
+    raw_text = response.choices[0].message.content or ""
+    cleaned = re.sub(r"^```(?:json)?|```$", "", raw_text.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {"is_job_post": False}
+
+
+def _job_signature(company: str, job_title: str, recruiter_email: str) -> tuple[str, str, str]:
+    """Normalized (company, job_title, recruiter_email) used to spot real
+    duplicates — same company + same role + same contact — regardless of
+    where the listing came from."""
+    return (
+        (company or "").strip().lower(),
+        (job_title or "").strip().lower(),
+        (recruiter_email or "").strip().lower(),
+    )
+
+
+linkedin_search_state = {"running": False}
+linkedin_search_log_queue: "queue.Queue" = queue.Queue()
+
+
+def run_linkedin_search():
+    linkedin_search_state["running"] = True
+
+    def log(msg: str):
+        linkedin_search_log_queue.put({"type": "log", "message": msg})
+
+    try:
+        groq_keys = load_groq_keys()
+        if not groq_keys:
+            log("❌ No Groq API keys configured in .env — aborting.")
+            linkedin_search_log_queue.put({"type": "done", "found": 0, "added": 0})
+            return
+        if not HARVESTAPI_KEY:
+            log("❌ HARVESTAPI_KEY not set in .env — aborting.")
+            linkedin_search_log_queue.put({"type": "done", "found": 0, "added": 0})
+            return
+
+        supabase = get_supabase()
+        keywords = get_search_keywords(supabase)["keywords"]
+        if not keywords:
+            log("❌ No search keywords set. Upload a resume (auto-generates keywords) "
+                "or set them manually first.")
+            linkedin_search_log_queue.put({"type": "done", "found": 0, "added": 0})
+            return
+
+        client = Groq(api_key=groq_keys[0])
+        log(f"Searching LinkedIn for {len(keywords)} keyword(s): {', '.join(keywords)}")
+
+        # Gather + de-dupe posts across all keywords first, so overlapping
+        # keywords don't process the same post twice.
+        seen_ids = set()
+        candidate_posts = []
+        for kw in keywords:
+            try:
+                posts = harvestapi_search_posts(kw)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  ⚠️  search for '{kw}' failed: {exc}")
+                continue
+            fresh = [p for p in posts if is_recent_post(p)]
+            log(f"  '{kw}': {len(posts)} result(s), {len(fresh)} within the last "
+                f"{LINKEDIN_MAX_POST_AGE_DAYS} day(s).")
+            for p in fresh:
+                pid = p.get("id") or p.get("linkedinUrl")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    candidate_posts.append(p)
+
+        total = len(candidate_posts)
+        linkedin_search_log_queue.put({"type": "start", "total": total})
+        if total == 0:
+            log("No fresh matching posts found.")
+            linkedin_search_log_queue.put({"type": "done", "found": 0, "added": 0})
+            return
+
+        # Skip posts already saved (by linkedin_url) so re-running doesn't duplicate.
+        existing = supabase.table(SUPABASE_TABLE).select("linkedin_url").eq("source", "linkedin").execute()
+        already_saved = {r["linkedin_url"] for r in (existing.data or []) if r.get("linkedin_url")}
+
+        # A "real" duplicate is the same company + job title + recruiter email,
+        # regardless of which post or source it came from (e.g. the same
+        # listing reposted under a different LinkedIn URL, or already added
+        # via the screenshot pipeline). Built once up front, then updated as
+        # we go so duplicates within this same run are also caught.
+        all_rows = supabase.table(SUPABASE_TABLE).select("company,job_title,recruiter_email").execute()
+        existing_signatures = {
+            _job_signature(r.get("company"), r.get("job_title"), r.get("recruiter_email"))
+            for r in (all_rows.data or [])
+        }
+
+        added = 0
+        skipped_not_genuine = 0
+        skipped_duplicate = 0
+        for idx, post in enumerate(candidate_posts, start=1):
+            post_url = post.get("linkedinUrl") or ""
+            if post_url and post_url in already_saved:
+                continue
+
+            post_text = post.get("content") or ""
+            author = (post.get("author") or {}).get("name") or ""
+            log(f"[{idx}/{total}] Checking post by {author or 'unknown'} ...")
+
+            try:
+                fields = extract_fields_from_linkedin_post(client, post_text)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[{idx}/{total}] ⚠️  extraction failed: {exc}. Skipping.")
+                continue
+
+            if not fields.get("is_job_post"):
+                continue
+
+            has_email = bool((fields.get("recruiter_email") or "").strip())
+            is_direct = fields.get("is_direct_listing", True)  # tolerate older/odd responses
+            if LINKEDIN_REQUIRE_GENUINE_CONTACT and (not has_email or not is_direct):
+                reason = "no genuine contact email found" if not has_email else "looks like an aggregator/repost, not a direct listing"
+                log(f"[{idx}/{total}] ⏭️  skipped ({reason}): {fields.get('company') or author or 'unknown'}")
+                skipped_not_genuine += 1
+                continue
+
+            sig = _job_signature(fields.get("company"), fields.get("job_title"), fields.get("recruiter_email"))
+            if sig in existing_signatures:
+                log(f"[{idx}/{total}] ⏭️  skipped (duplicate — same company + title + email already saved): "
+                    f"{fields.get('company') or '?'} - {fields.get('job_title') or '?'}")
+                skipped_duplicate += 1
+                continue
+
+            posted_dt = _post_posted_datetime(post)
+            row = {
+                "recruiter_email": fields.get("recruiter_email", ""),
+                "recruiter_name": fields.get("recruiter_name") or author,
+                "company": fields.get("company", ""),
+                "job_title": fields.get("job_title", ""),
+                "location": fields.get("location", ""),
+                "job_match_score": fields.get("job_match_score", 0) or 0,
+                "priority": fields.get("priority", ""),
+                "email_subject": fields.get("email_subject", ""),
+                "email_body": fields.get("email_body", ""),
+                "email_status": "Not Sent",
+                "sent_date": None,
+                "follow_up_date": None,
+                "source": "linkedin",
+                "linkedin_url": post_url,
+                "posted_date": posted_dt.date().isoformat() if posted_dt else None,
+            }
+            try:
+                insert_resp = supabase.table(SUPABASE_TABLE).insert(row).execute()
+            except Exception as exc:  # noqa: BLE001
+                log(f"[{idx}/{total}] ❌ couldn't save to the table ({exc}).")
+                continue
+
+            inserted_row = (insert_resp.data or [{}])[0]
+            index_job(supabase, {**row, "id": inserted_row.get("id")})
+            existing_signatures.add(sig)
+            added += 1
+            log(f"[{idx}/{total}] ✅ {row['company'] or '?'} | {row['job_title'] or '?'} | "
+                f"score={row['job_match_score']} | posted {row['posted_date'] or '?'}")
+            linkedin_search_log_queue.put({"type": "progress", "idx": idx, "total": total, "row": row})
+
+        log(f"Done. {added} new job(s) added out of {total} fresh post(s) checked "
+            f"({skipped_not_genuine} not-genuine, {skipped_duplicate} duplicate).")
+        linkedin_search_log_queue.put({"type": "done", "found": total, "added": added})
+
+    except Exception as exc:  # noqa: BLE001
+        linkedin_search_log_queue.put({"type": "log", "message": f"❌ LinkedIn search crashed: {exc}"})
+        linkedin_search_log_queue.put({"type": "done", "found": 0, "added": 0})
+    finally:
+        linkedin_search_state["running"] = False
+
+
+# --------------------------------------------------------------------------
 # PIPELINE: Supabase Storage -> Groq extraction -> Supabase table -> delete
 # --------------------------------------------------------------------------
 
@@ -672,6 +1082,51 @@ def find_any_job(supabase: Client, query: str = "", job_id: int | None = None) -
     ]
 
 
+def find_bulk_send_matches(supabase: Client, query: str) -> list[dict]:
+    """Used by send_mail_bulk. `query` is one of: 'today', 'this week', 'all'
+    (pending only in every case), or a free-text company/title/recruiter
+    substring — same matching as find_job_matches, but returns every match
+    rather than requiring exactly one."""
+    q = (query or "").strip().lower()
+    resp = supabase.table(SUPABASE_TABLE).select("*").neq("email_status", "Sent").execute()
+    rows = resp.data or []
+    today_str = date.today().isoformat()
+    week_ago_str = (date.today() - timedelta(days=7)).isoformat()
+
+    if q in ("today", "created today"):
+        return [r for r in rows if (r.get("created_at") or "")[:10] == today_str]
+    if q in ("this week", "week", "last 7 days", "past week"):
+        return [r for r in rows if (r.get("created_at") or "")[:10] >= week_ago_str]
+    if q in ("all", "all pending", "everything", "*"):
+        return rows
+    return [
+        r for r in rows
+        if q in (r.get("company") or "").lower()
+        or q in (r.get("job_title") or "").lower()
+        or q in (r.get("recruiter_name") or "").lower()
+    ]
+
+
+def get_recent_sent_emails(supabase: Client, scope: str = "", limit: int = 20) -> list[dict]:
+    """Compact {id, company, job_title, gmail_message_id, sent_date} rows for
+    already-sent jobs — deliberately small so 'give me the mail ids' never
+    blows the chat model's tiny token budget."""
+    resp = supabase.table(SUPABASE_TABLE).select(
+        "id,company,job_title,gmail_message_id,sent_date"
+    ).eq("email_status", "Sent").order("sent_date", desc=True).execute()
+    rows = resp.data or []
+
+    scope = (scope or "").strip().lower()
+    if scope in ("today", "sent today"):
+        today_str = date.today().isoformat()
+        rows = [r for r in rows if r.get("sent_date") == today_str]
+    elif scope in ("this week", "week", "last 7 days"):
+        week_ago_str = (date.today() - timedelta(days=7)).isoformat()
+        rows = [r for r in rows if (r.get("sent_date") or "") >= week_ago_str]
+
+    return rows[: max(1, min(int(limit or 20), 50))]
+
+
 # Columns the chatbot is allowed to read/write on job_applications.
 EDITABLE_JOB_COLUMNS = {
     "recruiter_email", "recruiter_name", "company", "job_title", "location",
@@ -687,7 +1142,7 @@ def send_mail_for_job(supabase: Client, row: dict) -> str:
     resume_filename, resume_bytes = get_current_resume_bytes(supabase)
 
     gmail = get_gmail_service()
-    gmail.send_mail(
+    message_id = gmail.send_mail(
         to_email=row["recruiter_email"],
         subject=row.get("email_subject") or f"Application - {CANDIDATE_NAME}",
         body=row.get("email_body") or "",
@@ -700,6 +1155,7 @@ def send_mail_for_job(supabase: Client, row: dict) -> str:
         "email_status": "Sent",
         "sent_date": today.isoformat(),
         "follow_up_date": (today + timedelta(days=7)).isoformat(),
+        "gmail_message_id": message_id or None,
     }
     supabase.table(SUPABASE_TABLE).update(updates).eq("id", row["id"]).execute()
     index_job(supabase, {**row, **updates})
@@ -862,6 +1318,86 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_keywords",
+            "description": "Get the current LinkedIn search keywords (extracted from the resume, but manually editable). Use when the user asks what keywords are set, or before suggesting a LinkedIn search.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_keywords",
+            "description": "Replace the LinkedIn search keyword list with a new one the user has specified (add/remove/rewrite). Always send the FULL resulting list, not just the changed items. Keywords should be full search strings pairing a role/skill with hiring intent (e.g. \"AI Engineer Hiring\", \"Hiring Python Developer\") rather than bare single words, since LinkedIn's post search matches actual post text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The full new list of search strings to save, e.g. 'Hiring Backend Engineer', not bare words like 'Backend'.",
+                    }
+                },
+                "required": ["keywords"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_linkedin_jobs",
+            "description": f"Search LinkedIn for job posts matching the saved keywords, keeping only posts from the last {LINKEDIN_MAX_POST_AGE_DAYS} days, and add any genuine job postings found to the jobs table with drafted emails. Runs in the background — use when the user asks to search/check LinkedIn for new jobs.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sent_emails",
+            "description": "Get a compact list of already-sent emails (id, company, job title, Gmail message id, sent date) — NOT the full job rows. Use this (not list_jobs) whenever the user asks for mail ids, how many were sent today/this week, or wants a short list of recent sends.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "'today', 'this week', or empty for all time.",
+                    },
+                    "limit": {"type": "integer", "description": "Max rows, default 20, hard cap 50."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_mail_bulk",
+            "description": (
+                "Send application emails to MULTIPLE unsent jobs at once, e.g. 'send all "
+                "mail created today', 'send this week's applications', 'send all pending', "
+                "or 'send everything at Acme'. This is a TWO-STEP tool just like delete_job: "
+                "1) First call it WITHOUT confirm (or confirm=false) — you'll get back how many "
+                "jobs match and their companies; show this to the user and ask them to confirm. "
+                "2) Only call it again WITH confirm=true after the user clearly says yes. Never "
+                "set confirm=true on the first call. This sends REAL emails and cannot be undone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "'today', 'this week', 'all', or a company/title/recruiter substring identifying which unsent jobs to include.",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to actually send. Leave false/omitted for the initial lookup-and-confirm step.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -965,6 +1501,62 @@ def run_chat_tool(name: str, args: dict, supabase: Client) -> str:
             delete_job_from_index(supabase, row["id"])
             return f"Deleted job #{row['id']} ({row.get('company')} - {row.get('job_title')})."
 
+    if name == "get_keywords":
+        data = get_search_keywords(supabase)
+        if not data["keywords"]:
+            return "No search keywords set yet. Upload a resume to auto-generate some, or set them manually."
+        return json.dumps(data)
+
+    if name == "update_keywords":
+        keywords = args.get("keywords") or []
+        if not keywords:
+            return "Give me at least one keyword to save."
+        data = save_search_keywords(supabase, keywords)
+        return f"Saved {len(data['keywords'])} search keyword(s): {', '.join(data['keywords'])}."
+
+    if name == "search_linkedin_jobs":
+        if linkedin_search_state["running"]:
+            return "A LinkedIn search is already running — check the console panel for progress."
+        keywords = get_search_keywords(supabase)["keywords"]
+        if not keywords:
+            return "No search keywords set yet — upload a resume or set keywords first."
+        threading.Thread(target=run_linkedin_search, daemon=True).start()
+        return (f"Started searching LinkedIn for posts matching your {len(keywords)} keyword(s), "
+                f"keeping only ones posted in the last {LINKEDIN_MAX_POST_AGE_DAYS} days. "
+                f"Watch the console panel for progress.")
+
+    if name == "get_sent_emails":
+        rows = get_recent_sent_emails(supabase, args.get("scope", ""), args.get("limit", 20))
+        if not rows:
+            return "No sent emails matched that."
+        return json.dumps(rows)
+
+    if name == "send_mail_bulk":
+        matches = find_bulk_send_matches(supabase, args.get("query", ""))
+        if not matches:
+            return f"No unsent jobs matched '{args.get('query')}'."
+        if args.get("confirm") is not True:
+            companies = ", ".join(f"{m.get('company') or '?'} ({m.get('job_title') or '?'})" for m in matches[:10])
+            more = f" and {len(matches) - 10} more" if len(matches) > 10 else ""
+            return (f"Found {len(matches)} unsent job(s) matching '{args.get('query')}': "
+                    f"{companies}{more}. This will send {len(matches)} real email(s) and cannot be "
+                    f"undone — ask the user to confirm, then call send_mail_bulk again with "
+                    f"confirm=true only if they say yes.")
+        sent, failed = [], []
+        for row in matches:
+            try:
+                send_mail_for_job(supabase, row)
+                sent.append(row.get("company") or f"#{row.get('id')}")
+            except Exception as exc:  # noqa: BLE001 - one failure shouldn't stop the batch
+                failed.append(f"{row.get('company') or row.get('id')}: {exc}")
+        summary = f"Sent {len(sent)}/{len(matches)} email(s)."
+        if sent:
+            shown = ", ".join(sent[:10])
+            summary += f" Sent to: {shown}{' and ' + str(len(sent) - 10) + ' more' if len(sent) > 10 else ''}."
+        if failed:
+            summary += f" Failed ({len(failed)}): {'; '.join(failed[:5])}."
+        return summary
+
     if name == "search_knowledge":
         query = args.get("query", "")
         try:
@@ -1003,17 +1595,31 @@ today/this week, breakdowns by priority or status — always use get_stats
 first; it already includes sent_today and sent_last_7_days. Only fall back
 to list_jobs if get_stats genuinely doesn't cover what was asked.
 
+For anything about mail IDs, or a short list of what was recently sent, ALWAYS
+use get_sent_emails — never list_jobs or search_knowledge for this, they
+return far more data than needed and can fail with a "request too large"
+error. Only call one tool per question when possible; don't chain multiple
+broad tools together.
+
+You can also help with the LinkedIn sourcing flow:
+- get_keywords / update_keywords manage the LinkedIn search keywords, which
+  are auto-extracted from the candidate's resume but always user-editable.
+- search_linkedin_jobs kicks off a background search of LinkedIn for posts
+  matching those keywords, keeping only ones posted recently, and adds any
+  genuine job postings found (with a drafted email) to the jobs table.
+
 Be concise and direct. When you change something (send mail, edit a field,
 delete a row, start processing), confirm exactly what happened in plain
 language. If a request is ambiguous — which job to act on, or which field to
 change — ask one short clarifying question instead of guessing.
 
-DELETING IS ALWAYS TWO STEPS: never call delete_job with confirm=true on the
-first attempt, no matter how sure the user sounds. First look the job up
-(confirm omitted/false), show the user exactly which job you found, and ask
-them to confirm. Only call delete_job again with confirm=true after they
-clearly say yes in their next message. If they say no or don't confirm, don't
-delete anything.
+DELETING AND BULK-SENDING ARE ALWAYS TWO STEPS: never call delete_job or
+send_mail_bulk with confirm=true on the first attempt, no matter how sure the
+user sounds. First look the match(es) up (confirm omitted/false), show the
+user exactly what you found (which job, or how many jobs and which
+companies), and ask them to confirm. Only call the tool again with
+confirm=true after they clearly say yes in their next message. If they say no
+or don't confirm, don't act.
 """
 
 
@@ -1093,7 +1699,14 @@ async def api_upload_resume(file: UploadFile = File(...)):
             detail=f"Couldn't upload to the '{SUPABASE_RESUME_BUCKET}' bucket — has it been created in Supabase Storage yet? ({exc})",
         )
     index_resume(supabase, safe_name, content)
-    return {"name": safe_name}
+
+    keywords_result = None
+    try:
+        keywords_result = regenerate_keywords_from_current_resume(supabase)
+    except Exception as exc:  # noqa: BLE001 - keyword generation must never break the upload
+        print(f"⚠️  Couldn't auto-generate search keywords from the new resume: {exc}")
+
+    return {"name": safe_name, "keywords": (keywords_result or {}).get("keywords", [])}
 
 
 @app.delete("/api/resume")
@@ -1115,6 +1728,60 @@ def api_reindex_all():
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Reindex failed: {exc}")
     return counts
+
+
+class KeywordsRequest(BaseModel):
+    keywords: list[str]
+
+
+@app.get("/api/keywords")
+def api_get_keywords():
+    supabase = get_supabase()
+    return get_search_keywords(supabase)
+
+
+@app.post("/api/keywords")
+def api_set_keywords(req: KeywordsRequest):
+    supabase = get_supabase()
+    return save_search_keywords(supabase, req.keywords)
+
+
+@app.post("/api/keywords/regenerate")
+def api_regenerate_keywords():
+    supabase = get_supabase()
+    try:
+        return regenerate_keywords_from_current_resume(supabase)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/linkedin/search/start")
+def api_start_linkedin_search():
+    if linkedin_search_state["running"]:
+        return {"status": "already_running"}
+    if not HARVESTAPI_KEY:
+        raise HTTPException(status_code=400, detail="HARVESTAPI_KEY not set in .env")
+    while not linkedin_search_log_queue.empty():
+        linkedin_search_log_queue.get_nowait()
+    threading.Thread(target=run_linkedin_search, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/api/linkedin/search/stream")
+async def api_linkedin_search_stream():
+    def event_gen():
+        while True:
+            try:
+                item = linkedin_search_log_queue.get(timeout=1)
+                yield f"data: {json.dumps(item)}\n\n"
+                if item["type"] == "done":
+                    break
+            except queue.Empty:
+                if not linkedin_search_state["running"]:
+                    break
+                yield ": keep-alive\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.get("/api/jobs")
@@ -1175,7 +1842,7 @@ def api_chat(req: ChatRequest):
     supabase = get_supabase()
 
     messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
-    messages.extend(req.history)
+    messages.extend(req.history[-CHAT_HISTORY_TURNS:])
     messages.append({"role": "user", "content": req.message})
 
     try:
@@ -1187,6 +1854,7 @@ def api_chat(req: ChatRequest):
                 tools=CHAT_TOOLS,
                 tool_choice="auto",
                 temperature=0.4,
+                max_completion_tokens=CHAT_MAX_OUTPUT_TOKENS,
             )
             choice = response.choices[0].message
 
@@ -1205,6 +1873,9 @@ def api_chat(req: ChatRequest):
                     result = run_chat_tool(tool_call.function.name, args, supabase)
                 except Exception as tool_exc:  # noqa: BLE001 - one bad tool call shouldn't crash the whole reply
                     result = f"That action failed: {tool_exc}"
+                if result and len(result) > TOOL_RESULT_CHAR_LIMIT:
+                    result = result[:TOOL_RESULT_CHAR_LIMIT] + \
+                        f"... [truncated — {len(result)} chars total, narrow your query for more]"
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -1213,6 +1884,18 @@ def api_chat(req: ChatRequest):
         else:
             reply = "That took more steps than expected — could you rephrase or narrow the question?"
     except Exception as exc:  # noqa: BLE001 - never let this crash unhandled
+        exc_str = str(exc)
+        if "rate_limit_exceeded" in exc_str or "429" in exc_str:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Groq's rate limit for this model was hit (its on-demand tier allows "
+                    f"very little traffic per minute). I've already capped responses at "
+                    f"{CHAT_MAX_OUTPUT_TOKENS} output tokens — try a shorter/narrower "
+                    "question, wait a few seconds and retry, or upgrade at "
+                    "console.groq.com/settings/billing for more headroom."
+                ),
+            )
         raise HTTPException(status_code=500, detail=f"Chat failed: {exc}")
 
     return {"reply": reply}
