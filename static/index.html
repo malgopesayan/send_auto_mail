@@ -568,6 +568,44 @@
     .pie-legend-label { font-size: 11.5px; }
     .pie-legend-value { font-size: 12.5px; }
     .pie-legend-total { font-size: 10.5px; padding-top: 8px; }
+
+    /* --- WhatsApp-style bottom tab switcher (mobile only) --- */
+    main { padding-bottom: 84px; }
+
+    #mobile-tabbar {
+      display: flex;
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      z-index: 40;
+      background: var(--panel);
+      border-top: 1px solid var(--panel-border);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    #mobile-tabbar .tab-btn {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-family: 'Inter', sans-serif;
+      font-size: 10.5px;
+      letter-spacing: 0.02em;
+      padding: 9px 4px 8px;
+      cursor: pointer;
+    }
+    #mobile-tabbar .tab-icon { width: 22px; height: 22px; }
+    #mobile-tabbar .tab-btn.active { color: var(--accent-amber); }
+
+    #chat-toggle {
+      bottom: calc(64px + max(10px, env(safe-area-inset-bottom, 0px)));
+    }
+
+    /* Only one "page" of panels visible at a time on mobile */
+    [data-page]:not(.tab-active) { display: none; }
   }
 </style>
 </head>
@@ -585,14 +623,14 @@
 </header>
 
 <main>
-  <div class="stats-row" id="stats-row">
+  <div class="stats-row tab-active" id="stats-row" data-page="home">
     <div class="stat-chip"><div class="label">Total Jobs</div><div class="value" id="stat-total">—</div></div>
     <div class="stat-chip"><div class="label">High Priority</div><div class="value" id="stat-high">—</div></div>
     <div class="stat-chip"><div class="label">Sent</div><div class="value" id="stat-sent">—</div></div>
     <div class="stat-chip"><div class="label">Pending</div><div class="value" id="stat-pending">—</div></div>
   </div>
 
-  <section class="panel">
+  <section class="panel tab-active" data-page="home">
     <div class="panel-header">
       <h2>Applications Sent</h2>
       <div class="range-filter" id="range-filter">
@@ -612,7 +650,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" data-page="upload">
     <div class="panel-header">
       <h2>Add Screenshots</h2>
       <span id="upload-count" style="font-size:12px; color:var(--text-muted);"></span>
@@ -626,13 +664,14 @@
         <span>PNG / JPG / WEBP — multiple files OK</span>
       </label>
       <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp" multiple style="display:none;" />
-      <div style="display:flex; justify-content:flex-end; margin-top:12px;">
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px; flex-wrap:wrap;">
+        <button class="ghost" id="upload-run-send-btn" disabled title="Upload these screenshots, run the pipeline on them, then email every job it extracts">Upload &amp; Run + Send</button>
         <button class="primary" id="upload-btn" disabled>Upload</button>
       </div>
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" data-page="upload">
     <div class="panel-header">
       <h2>Resume</h2>
     </div>
@@ -651,7 +690,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" data-page="upload">
     <div class="panel-header">
       <h2>LinkedIn Search Keywords</h2>
       <span id="keywords-updated" style="font-size:12px; color:var(--text-muted);"></span>
@@ -671,7 +710,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" data-page="console">
     <div class="panel-header">
       <h2>Pipeline Console</h2>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -685,7 +724,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" data-page="jobs">
     <div class="panel-header">
       <h2>Jobs</h2>
       <button class="ghost" id="refresh-btn">Refresh</button>
@@ -695,6 +734,25 @@
     </div>
   </section>
 </main>
+
+<nav id="mobile-tabbar">
+  <button class="tab-btn active" data-tab="home">
+    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 9.5V19a1 1 0 0 0 1 1H10v-5.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.5a1 1 0 0 0 1-1V9.5"/></svg>
+    Home
+  </button>
+  <button class="tab-btn" data-tab="upload">
+    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15.5V4"/><path d="M7.5 8.5 12 4l4.5 4.5"/><path d="M4.5 15.5V18a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2.5"/></svg>
+    Upload
+  </button>
+  <button class="tab-btn" data-tab="console">
+    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="m7.5 9.5 3 3-3 3"/><path d="M12.5 15.5h4"/></svg>
+    Console
+  </button>
+  <button class="tab-btn" data-tab="jobs">
+    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4.5" width="14" height="16" rx="2"/><path d="M9 4.5V3.75A1.25 1.25 0 0 1 10.25 2.5h3.5A1.25 1.25 0 0 1 15 3.75V4.5"/><path d="M8.5 11h7"/><path d="M8.5 14.5h7"/><path d="M8.5 18h4.5"/></svg>
+    Jobs
+  </button>
+</nav>
 
 <button id="chat-toggle" title="Open assistant">💬</button>
 <div id="chat-panel">
@@ -714,6 +772,20 @@ const $ = (sel) => document.querySelector(sel);
 
 let jobsCache = [];
 let chatHistory = []; // [{role, content}]
+
+// --- Mobile bottom tab switcher (WhatsApp-style; no effect above 640px) ---
+function setActiveTab(page) {
+  document.querySelectorAll('[data-page]').forEach(el => {
+    el.classList.toggle('tab-active', el.dataset.page === page);
+  });
+  document.querySelectorAll('#mobile-tabbar .tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === page);
+  });
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll('#mobile-tabbar .tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
+});
 
 function badgeClassForPriority(priority) {
   if (!priority) return 'notsent';
@@ -946,12 +1018,16 @@ function setRunning(running) {
   $('#status-text').textContent = running ? 'RUNNING' : 'IDLE';
 }
 
-async function runPipeline() {
+async function runPipeline(autoSend = false) {
   setRunning(true);
   $('#console').innerHTML = '';
-  appendConsoleLine('Starting pipeline...', 'muted');
+  appendConsoleLine(autoSend ? 'Starting pipeline (extract, then auto-send each email)...' : 'Starting pipeline...', 'muted');
 
-  const startRes = await fetch('/api/process/start', { method: 'POST' });
+  const startRes = await fetch('/api/process/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto_send: autoSend }),
+  });
   const startData = await startRes.json();
   if (startData.status === 'already_running') {
     appendConsoleLine('Pipeline is already running.', 'warn');
@@ -985,7 +1061,7 @@ async function runPipeline() {
   };
 }
 
-$('#run-btn').addEventListener('click', runPipeline);
+$('#run-btn').addEventListener('click', () => runPipeline(false));
 
 $('#reindex-btn').addEventListener('click', async () => {
   const btn = $('#reindex-btn');
@@ -1131,6 +1207,7 @@ function updatePendingLabel() {
     ? `${pendingFiles.length} file(s) selected`
     : '';
   $('#upload-btn').disabled = pendingFiles.length === 0;
+  $('#upload-run-send-btn').disabled = pendingFiles.length === 0;
 }
 
 function addPendingFiles(fileList) {
@@ -1189,6 +1266,46 @@ $('#upload-btn').addEventListener('click', async () => {
     $('#file-input').value = '';
     $('#upload-btn').textContent = 'Upload';
     updatePendingLabel();
+  }
+});
+
+$('#upload-run-send-btn').addEventListener('click', async () => {
+  if (!pendingFiles.length) return;
+  const combinedBtn = $('#upload-run-send-btn');
+  combinedBtn.disabled = true;
+  $('#upload-btn').disabled = true;
+  combinedBtn.textContent = 'Uploading...';
+
+  const formData = new FormData();
+  pendingFiles.forEach(f => formData.append('files', f));
+
+  let uploadedCount = 0;
+  try {
+    const res = await fetch('/api/screenshots/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.uploaded && data.uploaded.length) {
+      uploadedCount = data.uploaded.length;
+      appendConsoleLine(`Uploaded ${data.uploaded.length} screenshot(s) to the bucket: ${data.uploaded.join(', ')}`, 'success');
+    }
+    if (data.skipped && data.skipped.length) {
+      appendConsoleLine(`Skipped (not an image): ${data.skipped.join(', ')}`, 'warn');
+    }
+    if (data.errors && data.errors.length) {
+      data.errors.forEach(e => appendConsoleLine(`❌ ${e.name}: ${e.error}`, 'fail'));
+    }
+  } catch (err) {
+    appendConsoleLine(`Upload failed: ${err.message}`, 'fail');
+  } finally {
+    pendingFiles = [];
+    $('#file-input').value = '';
+    combinedBtn.textContent = 'Upload & Run + Send';
+    updatePendingLabel();
+  }
+
+  if (uploadedCount > 0) {
+    await runPipeline(true);
+  } else {
+    appendConsoleLine('Nothing uploaded, so the pipeline was not started.', 'warn');
   }
 });
 
