@@ -51,6 +51,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from groq import Groq, RateLimitError, APIStatusError
+from openai import OpenAI
 from supabase import create_client, Client
 
 from langchain_core.documents import Document
@@ -79,6 +80,19 @@ SUPABASE_RESUME_BUCKET = os.environ.get("SUPABASE_RESUME_BUCKET", "resumes")
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.8-27b")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen/qwen3.8-27b")
+
+# --- Chat assistant provider ---
+# The extraction/vision pipelines above always use Groq. The chat *assistant*
+# (the 💬 dashboard chatbot) can instead run on OpenRouter's free tier, which
+# has a much friendlier rate limit than Groq's on-demand tier. Set
+# CHAT_PROVIDER=openrouter in .env to switch; "groq" (default) keeps the
+# original behavior using CHAT_MODEL above.
+CHAT_PROVIDER = os.environ.get("CHAT_PROVIDER", "groq").strip().lower()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m2.7:free")
+# Optional — only used for OpenRouter's leaderboard attribution, safe to leave unset.
+OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "")
+OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Job Application Pipeline")
 
 # --- RAG / knowledge base (LangChain + Gemini embeddings + pgvector) ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -234,6 +248,39 @@ def get_gmail_service() -> GmailService:
     if _gmail_service is None:
         _gmail_service = GmailService()
     return _gmail_service
+
+
+_openrouter_client = None
+
+
+def get_openrouter_client() -> OpenAI:
+    global _openrouter_client
+    if _openrouter_client is None:
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY not set in .env — required when CHAT_PROVIDER=openrouter.")
+        headers = {}
+        if OPENROUTER_SITE_URL:
+            headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_SITE_NAME:
+            headers["X-Title"] = OPENROUTER_SITE_NAME
+        _openrouter_client = OpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers=headers or None,
+        )
+    return _openrouter_client
+
+
+def get_chat_client_and_model():
+    """Returns (client, model_name) for whichever provider the chat assistant
+    is configured to use. Only affects /api/chat — extraction/vision pipelines
+    always use Groq directly, unrelated to this."""
+    if CHAT_PROVIDER == "openrouter":
+        return get_openrouter_client(), OPENROUTER_MODEL
+    groq_keys = load_groq_keys()
+    if not groq_keys:
+        raise RuntimeError("No Groq API key configured in .env")
+    return Groq(api_key=groq_keys[0]), CHAT_MODEL
 
 
 # --------------------------------------------------------------------------
@@ -935,11 +982,13 @@ pipeline_state = {"running": False}
 pipeline_log_queue: "queue.Queue" = queue.Queue()
 
 
-def run_pipeline():
+def run_pipeline(auto_send: bool = False):
     pipeline_state["running"] = True
 
     def log(msg: str):
         pipeline_log_queue.put({"type": "log", "message": msg})
+
+    mailed, mail_failed = 0, 0
 
     try:
         groq_keys = load_groq_keys()
@@ -1012,7 +1061,8 @@ def run_pipeline():
                 continue
 
             inserted_row = (insert_resp.data or [{}])[0]
-            index_job(supabase, {**row, "id": inserted_row.get("id")})
+            full_row = {**row, "id": inserted_row.get("id")}
+            index_job(supabase, full_row)
 
             try:
                 supabase.storage.from_(SUPABASE_BUCKET).remove([name])
@@ -1024,12 +1074,29 @@ def run_pipeline():
             log(f"[{idx}/{total}] {status_icon} {name} -> {row['company'] or '?'} | "
                 f"{row['job_title'] or '?'} | score={row['job_match_score']} | priority={row['priority']}")
             succeeded += 1
+
+            if auto_send:
+                if row.get("recruiter_email"):
+                    try:
+                        send_result = send_mail_for_job(supabase, full_row)
+                        log(f"[{idx}/{total}]    ✉️ {send_result}")
+                        mailed += 1
+                    except Exception as exc:  # noqa: BLE001 - a failed send must not kill the run
+                        log(f"[{idx}/{total}]    ❌ Couldn't send mail for {name}: {exc}")
+                        mail_failed += 1
+                else:
+                    log(f"[{idx}/{total}]    ⚠️ No recruiter email extracted — skipped auto-send for {name}.")
+                    mail_failed += 1
+
             pipeline_log_queue.put({
                 "type": "progress", "idx": idx, "total": total,
                 "status": "review" if flagged else "success", "name": name, "row": row,
             })
 
-        log(f"Done. {succeeded} succeeded, {failed} failed.")
+        summary = f"Done. {succeeded} succeeded, {failed} failed."
+        if auto_send:
+            summary += f" {mailed} email(s) sent, {mail_failed} not sent."
+        log(summary)
         pipeline_log_queue.put({"type": "done", "succeeded": succeeded, "failed": failed})
 
     except Exception as exc:  # noqa: BLE001 - never let the background thread die silently
@@ -1784,6 +1851,24 @@ async def api_linkedin_search_stream():
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
+@app.get("/api/chat/provider")
+def api_chat_provider():
+    """Lets you confirm which provider/model the chatbot is actually using
+    right now — handy after editing .env, since a running server won't pick
+    up changes until restarted."""
+    if CHAT_PROVIDER == "openrouter":
+        return {
+            "provider": "openrouter",
+            "model": OPENROUTER_MODEL,
+            "openrouter_api_key_set": bool(OPENROUTER_API_KEY),
+        }
+    return {
+        "provider": "groq",
+        "model": CHAT_MODEL,
+        "groq_api_key_set": bool(load_groq_keys()),
+    }
+
+
 @app.get("/api/jobs")
 def api_get_jobs():
     supabase = get_supabase()
@@ -1805,15 +1890,20 @@ def api_send_job(job_id: int):
     return {"message": message}
 
 
+class ProcessStartRequest(BaseModel):
+    auto_send: bool = False
+
+
 @app.post("/api/process/start")
-def api_start_process():
+def api_start_process(payload: ProcessStartRequest | None = None):
     if pipeline_state["running"]:
         return {"status": "already_running"}
+    auto_send = payload.auto_send if payload else False
     # Drain any stale messages from a previous run before starting fresh.
     while not pipeline_log_queue.empty():
         pipeline_log_queue.get_nowait()
-    threading.Thread(target=run_pipeline, daemon=True).start()
-    return {"status": "started"}
+    threading.Thread(target=run_pipeline, args=(auto_send,), daemon=True).start()
+    return {"status": "started", "auto_send": auto_send}
 
 
 @app.get("/api/process/stream")
@@ -1835,26 +1925,30 @@ async def api_process_stream():
 
 @app.post("/api/chat")
 def api_chat(req: ChatRequest):
-    groq_keys = load_groq_keys()
-    if not groq_keys:
-        raise HTTPException(status_code=500, detail="No Groq API key configured")
-    client = Groq(api_key=groq_keys[0])
+    try:
+        client, chat_model = get_chat_client_and_model()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
     supabase = get_supabase()
 
     messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
     messages.extend(req.history[-CHAT_HISTORY_TURNS:])
     messages.append({"role": "user", "content": req.message})
 
+    # Groq's newest chat completions API wants max_completion_tokens; OpenRouter
+    # (and most OpenAI-compatible APIs) expect the classic max_tokens.
+    output_token_kwarg = "max_tokens" if CHAT_PROVIDER == "openrouter" else "max_completion_tokens"
+
     try:
         reply = None
         for _ in range(5):  # hard cap so a confused model can't loop forever
             response = client.chat.completions.create(
-                model=CHAT_MODEL,
+                model=chat_model,
                 messages=messages,
                 tools=CHAT_TOOLS,
                 tool_choice="auto",
                 temperature=0.4,
-                max_completion_tokens=CHAT_MAX_OUTPUT_TOKENS,
+                **{output_token_kwarg: CHAT_MAX_OUTPUT_TOKENS},
             )
             choice = response.choices[0].message
 
@@ -1886,17 +1980,19 @@ def api_chat(req: ChatRequest):
     except Exception as exc:  # noqa: BLE001 - never let this crash unhandled
         exc_str = str(exc)
         if "rate_limit_exceeded" in exc_str or "429" in exc_str:
+            provider_name = "OpenRouter" if CHAT_PROVIDER == "openrouter" else "Groq"
+            billing_url = "openrouter.ai/settings/credits" if CHAT_PROVIDER == "openrouter" else "console.groq.com/settings/billing"
             raise HTTPException(
                 status_code=429,
                 detail=(
-                    "Groq's rate limit for this model was hit (its on-demand tier allows "
-                    f"very little traffic per minute). I've already capped responses at "
-                    f"{CHAT_MAX_OUTPUT_TOKENS} output tokens — try a shorter/narrower "
-                    "question, wait a few seconds and retry, or upgrade at "
-                    "console.groq.com/settings/billing for more headroom."
+                    f"{provider_name}'s rate limit for `{chat_model}` was hit (its free/"
+                    f"on-demand tier allows very little traffic per minute). I've already "
+                    f"capped responses at {CHAT_MAX_OUTPUT_TOKENS} output tokens — try a "
+                    f"shorter/narrower question, wait a few seconds and retry, or check "
+                    f"{billing_url} for more headroom."
                 ),
             )
-        raise HTTPException(status_code=500, detail=f"Chat failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Chat failed [{CHAT_PROVIDER}]: {exc}")
 
     return {"reply": reply}
 
