@@ -1202,6 +1202,16 @@ EDITABLE_JOB_COLUMNS = {
 }
 
 
+import contextvars
+
+# Request-scoped (not global) holder — safe even when FastAPI runs multiple
+# sync /api/chat requests concurrently in its thread pool, since each thread
+# gets its own ContextVar value.
+_chat_auth_url_var: contextvars.ContextVar = contextvars.ContextVar(
+    "_chat_auth_url_var", default=None
+)
+
+
 def send_mail_for_job(supabase: Client, row: dict) -> str:
     if not row.get("recruiter_email"):
         return f"'{row.get('company', 'that job')}' has no recruiter email on file, so I can't send it."
@@ -1218,6 +1228,10 @@ def send_mail_for_job(supabase: Client, row: dict) -> str:
             attachment_filename=resume_filename,
         )
     except GmailAuthRequired as e:
+        # Stash on the request-scoped ContextVar so /api/chat can surface it
+        # as structured JSON (needs_auth/auth_url) instead of relying on the
+        # LLM to faithfully repeat a raw URL in its paraphrased reply.
+        _chat_auth_url_var.set(e.auth_url)
         return (f"Gmail needs re-authorization before I can send anything — "
                 f"open {e.auth_url} , sign in once, then try sending again.")
 
@@ -1963,6 +1977,7 @@ async def api_process_stream():
 
 @app.post("/api/chat")
 def api_chat(req: ChatRequest):
+    _chat_auth_url_var.set(None)  # reset for this request
     try:
         client, chat_model = get_chat_client_and_model()
     except Exception as exc:  # noqa: BLE001
@@ -2032,6 +2047,9 @@ def api_chat(req: ChatRequest):
             )
         raise HTTPException(status_code=500, detail=f"Chat failed [{CHAT_PROVIDER}]: {exc}")
 
+    auth_url = _chat_auth_url_var.get()
+    if auth_url:
+        return {"reply": reply, "needs_auth": True, "auth_url": auth_url}
     return {"reply": reply}
 
 
