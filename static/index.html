@@ -1461,9 +1461,13 @@ async function sendChatMessage() {
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
+  appendChatMessage('user', text);
+  await sendChatMessageRaw(text);
+}
+
+async function sendChatMessageRaw(text) {
   $('#chat-send').disabled = true;
 
-  appendChatMessage('user', text);
   const thinkingEl = appendChatMessage('bot', 'Thinking...');
   thinkingEl.classList.add('thinking');
 
@@ -1487,6 +1491,23 @@ async function sendChatMessage() {
       appendChatMessage('bot', data.reply || 'Something went wrong.');
       chatHistory.push({ role: 'user', content: text });
       chatHistory.push({ role: 'assistant', content: data.reply || '' });
+
+      if (data.needs_auth && data.auth_url) {
+        appendChatMessage('bot', 'Opening the Google sign-in popup — once you approve it, I\'ll retry automatically.');
+        const popup = window.open(data.auth_url, 'gmail_auth', 'width=500,height=650');
+        if (!popup) {
+          appendChatMessage('bot', `Your browser blocked the popup — open this link manually: ${data.auth_url}`);
+        } else {
+          const poll = setInterval(() => {
+            if (popup.closed) {
+              clearInterval(poll);
+              appendChatMessage('user', text); // retry the same request once re-authed
+              sendChatMessageRaw(text);
+            }
+          }, 500);
+        }
+      }
+
       loadJobs(); // in case the chatbot sent mail, edited a job, or started processing
     }
   } catch (err) {
