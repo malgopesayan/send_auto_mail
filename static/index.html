@@ -997,13 +997,7 @@ async function sendJob(id) {
     }
     if (res.status === 401 && data.detail && data.detail.needs_auth) {
       appendConsoleLine('Gmail needs re-authorization — sign in in the popup, then it will retry automatically.', 'muted');
-      const popup = window.open(data.detail.auth_url, 'gmail_auth', 'width=500,height=650');
-      const poll = setInterval(() => {
-        if (popup.closed) {
-          clearInterval(poll);
-          sendJob(id); // retry once the popup is closed
-        }
-      }, 500);
+      openGmailAuthPopup(data.detail.auth_url, () => sendJob(id)); // retry once the popup is closed
       return;
     }
     appendConsoleLine(data.message || data.detail || 'Done.', res.ok ? 'success' : 'fail');
@@ -1012,6 +1006,28 @@ async function sendJob(id) {
   } finally {
     loadJobs();
   }
+}
+
+let gmailAuthPopup = null;
+function openGmailAuthPopup(authUrl, onClosed) {
+  // Avoid stacking multiple popups if several sends fail in a row before
+  // the user has finished authorizing the first one.
+  if (gmailAuthPopup && !gmailAuthPopup.closed) {
+    gmailAuthPopup.focus();
+    return;
+  }
+  gmailAuthPopup = window.open(authUrl, 'gmail_auth', 'width=500,height=650');
+  if (!gmailAuthPopup) {
+    appendConsoleLine(`Your browser blocked the popup — open this link manually: ${authUrl}`, 'warn');
+    return;
+  }
+  const poll = setInterval(() => {
+    if (gmailAuthPopup.closed) {
+      clearInterval(poll);
+      gmailAuthPopup = null;
+      if (onClosed) onClosed();
+    }
+  }, 500);
 }
 
 function appendConsoleLine(text, cls) {
@@ -1059,6 +1075,11 @@ async function runPipeline(autoSend = false) {
       } else if (item.status === 'review') {
         loadJobs();
       }
+    } else if (item.type === 'needs_auth') {
+      appendConsoleLine('Gmail needs re-authorization — opening the sign-in popup...', 'warn');
+      openGmailAuthPopup(item.auth_url, () => {
+        appendConsoleLine('Re-authorized — resume the pipeline or hit "Run Pipeline" again to retry any unsent emails.', 'success');
+      });
     } else if (item.type === 'done') {
       appendConsoleLine(`Finished — ${item.succeeded} succeeded, ${item.failed} failed.`, 'muted');
       setRunning(false);
@@ -1494,18 +1515,10 @@ async function sendChatMessageRaw(text) {
 
       if (data.needs_auth && data.auth_url) {
         appendChatMessage('bot', 'Opening the Google sign-in popup — once you approve it, I\'ll retry automatically.');
-        const popup = window.open(data.auth_url, 'gmail_auth', 'width=500,height=650');
-        if (!popup) {
-          appendChatMessage('bot', `Your browser blocked the popup — open this link manually: ${data.auth_url}`);
-        } else {
-          const poll = setInterval(() => {
-            if (popup.closed) {
-              clearInterval(poll);
-              appendChatMessage('user', text); // retry the same request once re-authed
-              sendChatMessageRaw(text);
-            }
-          }, 500);
-        }
+        openGmailAuthPopup(data.auth_url, () => {
+          appendChatMessage('user', text); // retry the same request once re-authed
+          sendChatMessageRaw(text);
+        });
       }
 
       loadJobs(); // in case the chatbot sent mail, edited a job, or started processing
