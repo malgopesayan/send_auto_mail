@@ -60,8 +60,8 @@ from langchain_community.vectorstores import SupabaseVectorStore
 from pypdf import PdfReader
 import docx as docx_lib
 
-# Gmail — exact class provided by the user, unchanged.
-from gmail_service import GmailService
+# Gmail — lazy auth, no more blocking run_local_server().
+from gmail_service import GmailService, GmailAuthRequired
 
 load_dotenv()
 
@@ -1209,13 +1209,17 @@ def send_mail_for_job(supabase: Client, row: dict) -> str:
     resume_filename, resume_bytes = get_current_resume_bytes(supabase)
 
     gmail = get_gmail_service()
-    message_id = gmail.send_mail(
-        to_email=row["recruiter_email"],
-        subject=row.get("email_subject") or f"Application - {CANDIDATE_NAME}",
-        body=row.get("email_body") or "",
-        attachment_bytes=resume_bytes,
-        attachment_filename=resume_filename,
-    )
+    try:
+        message_id = gmail.send_mail(
+            to_email=row["recruiter_email"],
+            subject=row.get("email_subject") or f"Application - {CANDIDATE_NAME}",
+            body=row.get("email_body") or "",
+            attachment_bytes=resume_bytes,
+            attachment_filename=resume_filename,
+        )
+    except GmailAuthRequired as e:
+        return (f"Gmail needs re-authorization before I can send anything — "
+                f"open {e.auth_url} , sign in once, then try sending again.")
 
     today = date.today()
     updates = {
@@ -1876,6 +1880,32 @@ def api_get_jobs():
     return resp.data or []
 
 
+@app.get("/api/gmail/status")
+def api_gmail_status():
+    return {"authenticated": get_gmail_service().is_authenticated()}
+
+
+@app.get("/api/gmail/auth-url")
+def api_gmail_auth_url():
+    return {"auth_url": get_gmail_service().get_auth_url()}
+
+
+@app.get("/api/gmail/oauth2callback")
+def api_gmail_oauth2callback(code: str | None = None, error: str | None = None):
+    if error:
+        raise HTTPException(status_code=400, detail=f"Google denied consent: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing ?code from Google")
+    get_gmail_service().exchange_code(code)
+    # Plain HTML so the popup can just be closed by hand; no frontend JS required.
+    return StreamingResponse(
+        iter(["<html><body style='font-family:sans-serif;padding:2rem'>"
+              "Gmail connected — you can close this tab and retry the send."
+              "</body></html>"]),
+        media_type="text/html",
+    )
+
+
 @app.post("/api/jobs/{job_id}/send")
 def api_send_job(job_id: int):
     supabase = get_supabase()
@@ -1883,6 +1913,14 @@ def api_send_job(job_id: int):
     rows = resp.data or []
     if not rows:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    gmail = get_gmail_service()
+    if not gmail.is_authenticated():
+        raise HTTPException(
+            status_code=401,
+            detail={"needs_auth": True, "auth_url": gmail.get_auth_url()},
+        )
+
     try:
         message = send_mail_for_job(supabase, rows[0])
     except Exception as exc:  # noqa: BLE001 - never let this crash unhandled
