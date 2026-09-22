@@ -1081,6 +1081,15 @@ def run_pipeline(auto_send: bool = False):
                         send_result = send_mail_for_job(supabase, full_row)
                         log(f"[{idx}/{total}]    ✉️ {send_result}")
                         mailed += 1
+                        if _chat_auth_url_var.get():
+                            # send_mail_for_job hit GmailAuthRequired — surface it
+                            # as its own event so the frontend can pop the
+                            # consent screen instead of leaving a dead-end log line.
+                            pipeline_log_queue.put({
+                                "type": "needs_auth",
+                                "auth_url": _chat_auth_url_var.get(),
+                            })
+                            _chat_auth_url_var.set(None)
                     except Exception as exc:  # noqa: BLE001 - a failed send must not kill the run
                         log(f"[{idx}/{total}]    ❌ Couldn't send mail for {name}: {exc}")
                         mail_failed += 1
