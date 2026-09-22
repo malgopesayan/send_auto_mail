@@ -995,6 +995,17 @@ async function sendJob(id) {
     } catch {
       data = { detail: await res.text().catch(() => 'Unknown error') };
     }
+    if (res.status === 401 && data.detail && data.detail.needs_auth) {
+      appendConsoleLine('Gmail needs re-authorization — sign in in the popup, then it will retry automatically.', 'muted');
+      const popup = window.open(data.detail.auth_url, 'gmail_auth', 'width=500,height=650');
+      const poll = setInterval(() => {
+        if (popup.closed) {
+          clearInterval(poll);
+          sendJob(id); // retry once the popup is closed
+        }
+      }, 500);
+      return;
+    }
     appendConsoleLine(data.message || data.detail || 'Done.', res.ok ? 'success' : 'fail');
   } catch (err) {
     appendConsoleLine(`Send failed: ${err.message}`, 'fail');
