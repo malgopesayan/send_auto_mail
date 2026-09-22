@@ -70,8 +70,14 @@ class GmailService:
             return self._service
 
         if creds and creds.expired and creds.refresh_token:
-            # This is the normal "token expired" case — silent, no popup.
-            creds.refresh(Request())
+            # Normal "token expired" case — silent, no popup. But the
+            # refresh_token itself can also die (revoked in Google account
+            # settings, or a 6-month inactive-token expiry) — that raises
+            # invalid_grant here, which we treat the same as "no token".
+            try:
+                creds.refresh(Request())
+            except Exception:
+                raise GmailAuthRequired(self.get_auth_url())
             self._save_creds(creds)
             self._service = build("gmail", "v1", credentials=creds)
             return self._service
