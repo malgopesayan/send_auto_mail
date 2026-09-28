@@ -122,6 +122,9 @@ LINKEDIN_REQUIRE_GENUINE_CONTACT = os.environ.get("LINKEDIN_REQUIRE_GENUINE_CONT
 # We ask for 'week' and then post-filter precisely by LINKEDIN_MAX_POST_AGE_DAYS.
 LINKEDIN_POSTED_LIMIT = "week"
 
+# Posts whose job_match_score is below this are NOT saved to the table.
+LINKEDIN_MIN_MATCH_SCORE = int(os.environ.get("LINKEDIN_MIN_MATCH_SCORE", "40"))
+
 API_KEY_ENV_VARS = [
     "GROQ_API_KEY",
     "GROQ_API_KEY1",
@@ -822,6 +825,14 @@ def _job_signature(company: str, job_title: str, recruiter_email: str) -> tuple[
     )
 
 
+def _safe_score(value) -> int:
+    """LLM may return the score as int, str ('35'), or None — normalize it."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 linkedin_search_state = {"running": False}
 linkedin_search_log_queue: "queue.Queue" = queue.Queue()
 
@@ -853,6 +864,7 @@ def run_linkedin_search():
 
         client = Groq(api_key=groq_keys[0])
         log(f"Searching LinkedIn for {len(keywords)} keyword(s): {', '.join(keywords)}")
+        log(f"Minimum match score to save: {LINKEDIN_MIN_MATCH_SCORE}")
 
         # Gather + de-dupe posts across all keywords first, so overlapping
         # keywords don't process the same post twice.
@@ -898,6 +910,7 @@ def run_linkedin_search():
         added = 0
         skipped_not_genuine = 0
         skipped_duplicate = 0
+        skipped_low_score = 0
         for idx, post in enumerate(candidate_posts, start=1):
             post_url = post.get("linkedinUrl") or ""
             if post_url and post_url in already_saved:
@@ -924,6 +937,15 @@ def run_linkedin_search():
                 skipped_not_genuine += 1
                 continue
 
+            # ---- score filter: don't insert low-match jobs ----
+            score = _safe_score(fields.get("job_match_score"))
+            if score < LINKEDIN_MIN_MATCH_SCORE:
+                log(f"[{idx}/{total}] ⏭️ skipped (match score {score} < {LINKEDIN_MIN_MATCH_SCORE}): "
+                    f"{fields.get('company') or author or 'unknown'} - {fields.get('job_title') or '?'}")
+                skipped_low_score += 1
+                continue
+            # ---------------------------------------------------
+
             sig = _job_signature(fields.get("company"), fields.get("job_title"), fields.get("recruiter_email"))
             if sig in existing_signatures:
                 log(f"[{idx}/{total}] ⏭️  skipped (duplicate — same company + title + email already saved): "
@@ -938,7 +960,7 @@ def run_linkedin_search():
                 "company": fields.get("company", ""),
                 "job_title": fields.get("job_title", ""),
                 "location": fields.get("location", ""),
-                "job_match_score": fields.get("job_match_score", 0) or 0,
+                "job_match_score": score,
                 "priority": fields.get("priority", ""),
                 "email_subject": fields.get("email_subject", ""),
                 "email_body": fields.get("email_body", ""),
@@ -964,7 +986,8 @@ def run_linkedin_search():
             linkedin_search_log_queue.put({"type": "progress", "idx": idx, "total": total, "row": row})
 
         log(f"Done. {added} new job(s) added out of {total} fresh post(s) checked "
-            f"({skipped_not_genuine} not-genuine, {skipped_duplicate} duplicate).")
+            f"({skipped_not_genuine} not-genuine, {skipped_duplicate} duplicate, "
+            f"{skipped_low_score} low-score).")
         linkedin_search_log_queue.put({"type": "done", "found": total, "added": added})
 
     except Exception as exc:  # noqa: BLE001
