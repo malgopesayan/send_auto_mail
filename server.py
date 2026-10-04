@@ -29,29 +29,30 @@ for _name in ("credentials.json", "token.json"):
         except Exception as exc:
             print(f"[server] could not prepare {_name}: {exc}")
 
-import app as app_module          # noqa: E402  (must come after the copy above)
+import app as app_module          # noqa: E402
 import scheduler                  # noqa: E402
 
 app = app_module.app
 
 
-def run_full_job():
-    """One scheduled slot: find new LinkedIn jobs, then process and send."""
+def run_full_job(mode: str = "both"):
+    """search = find jobs | send = mail pending rows | both = search then send."""
     # Nobody is attached to the SSE stream during a cron run, so drain the
     # log queues first or they grow with every line and are never read.
     for q in (app_module.linkedin_search_log_queue, app_module.pipeline_log_queue):
         while not q.empty():
             q.get_nowait()
 
-    app_module.run_linkedin_search()
-    app_module.run_pipeline(auto_send=True)
+    if mode in ("search", "both"):
+        app_module.run_linkedin_search()
+    if mode in ("send", "both"):
+        app_module.run_pipeline(auto_send=True)
 
 
 scheduler.configure(run_full_job, app_module.get_supabase)
 app.include_router(scheduler.router)
 
 
-# --- schedule panel injected into the existing dashboard --------------------
 PANEL = """
 <div id="sched-fab" title="Schedule">&#9200;</div>
 <div id="sched-back"></div>
@@ -63,7 +64,8 @@ PANEL = """
   <div id="sp-rows">loading...</div>
   <div class="sp-actions">
     <button type="button" id="sp-add">+ ADD TIME</button>
-    <button type="button" id="sp-run">RUN NOW</button>
+    <button type="button" id="sp-search">SEARCH NOW</button>
+    <button type="button" id="sp-send">SEND NOW</button>
   </div>
   <div id="sp-status"></div>
   <div id="sp-runs"></div>
@@ -74,7 +76,7 @@ PANEL = """
  font-size:22px;cursor:pointer;z-index:9998;box-shadow:0 4px 14px rgba(0,0,0,.5)}
 #sched-back{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9998}
 #sched-back.open{display:block}
-#sched-panel{position:fixed;left:16px;bottom:134px;width:380px;max-height:68vh;overflow:auto;
+#sched-panel{position:fixed;left:16px;bottom:134px;width:400px;max-height:68vh;overflow:auto;
  background:#14161a;color:#d8d8d8;border:1px solid #2e3238;border-radius:10px;padding:14px;
  z-index:9999;display:none;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;
  box-shadow:0 10px 30px rgba(0,0,0,.6)}
@@ -84,15 +86,14 @@ PANEL = """
 #sched-panel #sp-close{cursor:pointer;font-size:22px;opacity:.7;padding:0 6px;color:#d8d8d8}
 #sched-panel .sp-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;
  border:1px solid #23262b;border-radius:8px;padding:8px;margin:8px 0;background:#181b20}
-#sched-panel input,#sched-panel button{font:inherit;padding:6px 8px;border-radius:6px;
- border:1px solid #3a3f46;background:#1e2127;color:#e8e8e8}
-#sched-panel input[type=text]{width:104px}
+#sched-panel input,#sched-panel button,#sched-panel select{font:inherit;padding:6px 8px;
+ border-radius:6px;border:1px solid #3a3f46;background:#1e2127;color:#e8e8e8}
+#sched-panel input[type=text]{width:100px}
 #sched-panel button{cursor:pointer}
 #sched-panel button:hover{background:#2a2e35}
-#sched-panel .sp-actions{display:flex;gap:8px;margin-top:4px}
-#sched-panel #sp-tz,#sched-panel #sp-status,#sched-panel #sp-runs,#sched-panel .sp-last{
- opacity:.6;font-size:11px}
-#sched-panel #sp-status{margin-top:8px;color:#f5a524;opacity:.9;word-break:break-word}
+#sched-panel .sp-actions{display:flex;gap:6px;margin-top:4px;flex-wrap:wrap}
+#sched-panel #sp-tz,#sched-panel #sp-runs,#sched-panel .sp-last{opacity:.6;font-size:11px}
+#sched-panel #sp-status{margin-top:8px;color:#f5a524;font-size:11px;word-break:break-word}
 #sched-panel .sp-last{width:100%}
 #sched-panel #sp-runs{margin-top:10px;border-top:1px solid #23262b;padding-top:8px;
  line-height:1.6}
@@ -100,7 +101,7 @@ PANEL = """
  #sched-panel{left:8px;right:8px;width:auto;bottom:70px;max-height:78vh}
  #sched-fab{bottom:72px;left:12px}
  #sched-panel .sp-row{flex-direction:column;align-items:stretch}
- #sched-panel input[type=text],#sched-panel input[type=time]{width:100%}
+ #sched-panel input[type=text],#sched-panel input[type=time],#sched-panel select{width:100%}
  #sched-panel .sp-actions button{flex:1}
 }
 </style>
@@ -120,17 +121,18 @@ PANEL = """
      say('Error '+r.status+': '+t); throw new Error(t);});}
    return r.json();});}
 
+ function runNow(m){say('');
+   call('/api/full-run?mode='+m,{method:'POST'}).then(function(){
+     say('Started ('+m+') - open the Console tab.');
+     setTimeout(spLoad,1500);}).catch(function(){});}
+
  document.getElementById('sp-add').onclick=function(){
    say('');
    call('/api/schedules',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({label:'New run',run_at:'10:00',enabled:true})})
+    body:JSON.stringify({label:'New run',run_at:'10:00',mode:'search',enabled:true})})
     .then(spLoad).catch(function(){});};
-
- document.getElementById('sp-run').onclick=function(){
-   say('');
-   call('/api/full-run',{method:'POST'}).then(function(){
-     say('Started - open the Console tab to watch.');
-     setTimeout(spLoad,1500);}).catch(function(){});};
+ document.getElementById('sp-search').onclick=function(){runNow('search');};
+ document.getElementById('sp-send').onclick=function(){runNow('send');};
 
  window.spSave=function(id){
   var r=document.querySelector('[data-sid="'+id+'"]');
@@ -139,6 +141,7 @@ PANEL = """
    headers:{'Content-Type':'application/json'},
    body:JSON.stringify({label:r.querySelector('.sp-l').value.trim()||'Run',
                         run_at:r.querySelector('.sp-t').value,
+                        mode:r.querySelector('.sp-m').value,
                         enabled:r.querySelector('.sp-o').checked})})
    .then(function(){say('Saved.');spLoad();}).catch(function(){});};
 
@@ -151,9 +154,13 @@ PANEL = """
   call('/api/schedules').then(function(d){
    document.getElementById('sp-tz').textContent='('+d.timezone+')';
    document.getElementById('sp-rows').innerHTML=(d.schedules||[]).map(function(s){
+    var m=s.mode||'both';
     return '<div class="sp-row" data-sid="'+s.id+'">'+
       '<input type="text" class="sp-l" value="'+s.label+'">'+
       '<input type="time" class="sp-t" value="'+String(s.run_at).slice(0,5)+'">'+
+      '<select class="sp-m">'+['search','send','both'].map(function(v){
+        return '<option value="'+v+'"'+(m===v?' selected':'')+'>'+v+'</option>';
+      }).join('')+'</select>'+
       '<label><input type="checkbox" class="sp-o" '+(s.enabled?'checked':'')+'> on</label>'+
       '<button onclick="spSave('+s.id+')">SAVE</button>'+
       '<button onclick="spDel('+s.id+')">DEL</button>'+
