@@ -29,7 +29,7 @@ for _name in ("credentials.json", "token.json"):
         except Exception as exc:
             print(f"[server] could not prepare {_name}: {exc}")
 
-import app as app_module          # noqa: E402
+import app as app_module          # noqa: E402  (must come after the copy above)
 import scheduler                  # noqa: E402
 
 app = app_module.app
@@ -37,9 +37,12 @@ app = app_module.app
 
 def run_full_job():
     """One scheduled slot: find new LinkedIn jobs, then process and send."""
+    # Nobody is attached to the SSE stream during a cron run, so drain the
+    # log queues first or they grow with every line and are never read.
     for q in (app_module.linkedin_search_log_queue, app_module.pipeline_log_queue):
         while not q.empty():
             q.get_nowait()
+
     app_module.run_linkedin_search()
     app_module.run_pipeline(auto_send=True)
 
@@ -48,6 +51,7 @@ scheduler.configure(run_full_job, app_module.get_supabase)
 app.include_router(scheduler.router)
 
 
+# --- schedule panel injected into the existing dashboard --------------------
 PANEL = """
 <div id="sched-fab" title="Schedule">&#9200;</div>
 <div id="sched-back"></div>
@@ -88,6 +92,7 @@ PANEL = """
 #sched-panel .sp-actions{display:flex;gap:8px;margin-top:4px}
 #sched-panel #sp-tz,#sched-panel #sp-status,#sched-panel #sp-runs,#sched-panel .sp-last{
  opacity:.6;font-size:11px}
+#sched-panel #sp-status{margin-top:8px;color:#f5a524;opacity:.9;word-break:break-word}
 #sched-panel .sp-last{width:100%}
 #sched-panel #sp-runs{margin-top:10px;border-top:1px solid #23262b;padding-top:8px;
  line-height:1.6}
@@ -108,27 +113,42 @@ PANEL = """
    P.classList.contains('open')?shut():open();};
  document.getElementById('sp-close').onclick=shut; B.onclick=shut;
 
+ function say(m){document.getElementById('sp-status').textContent=m;}
+
+ function call(u,o){return fetch(u,o).then(function(r){
+   if(!r.ok){return r.text().then(function(t){
+     say('Error '+r.status+': '+t); throw new Error(t);});}
+   return r.json();});}
+
  document.getElementById('sp-add').onclick=function(){
-   fetch('/api/schedules',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({label:'New run',run_at:'10:00',enabled:true})}).then(spLoad);};
+   say('');
+   call('/api/schedules',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({label:'New run',run_at:'10:00',enabled:true})})
+    .then(spLoad).catch(function(){});};
+
  document.getElementById('sp-run').onclick=function(){
-   fetch('/api/full-run',{method:'POST'}).then(function(r){
-     document.getElementById('sp-status').textContent=
-       r.ok?'Started - open the Console tab to watch.':'A run is already in progress.';
-     setTimeout(spLoad,1500);});};
+   say('');
+   call('/api/full-run',{method:'POST'}).then(function(){
+     say('Started - open the Console tab to watch.');
+     setTimeout(spLoad,1500);}).catch(function(){});};
 
  window.spSave=function(id){
   var r=document.querySelector('[data-sid="'+id+'"]');
-  fetch('/api/schedules/'+id,{method:'PATCH',
+  say('');
+  call('/api/schedules/'+id,{method:'PATCH',
    headers:{'Content-Type':'application/json'},
    body:JSON.stringify({label:r.querySelector('.sp-l').value.trim()||'Run',
                         run_at:r.querySelector('.sp-t').value,
-                        enabled:r.querySelector('.sp-o').checked})}).then(spLoad);};
- window.spDel=function(id){if(!confirm('Delete this schedule?'))return;
-  fetch('/api/schedules/'+id,{method:'DELETE'}).then(spLoad);};
+                        enabled:r.querySelector('.sp-o').checked})})
+   .then(function(){say('Saved.');spLoad();}).catch(function(){});};
+
+ window.spDel=function(id){
+  if(!confirm('Delete this schedule?'))return;
+  say('');
+  call('/api/schedules/'+id,{method:'DELETE'}).then(spLoad).catch(function(){});};
 
  function spLoad(){
-  fetch('/api/schedules').then(function(r){return r.json()}).then(function(d){
+  call('/api/schedules').then(function(d){
    document.getElementById('sp-tz').textContent='('+d.timezone+')';
    document.getElementById('sp-rows').innerHTML=(d.schedules||[]).map(function(s){
     return '<div class="sp-row" data-sid="'+s.id+'">'+
@@ -140,11 +160,10 @@ PANEL = """
       '<div class="sp-last">last run: '+
         (s.last_run_at?new Date(s.last_run_at).toLocaleString():'never')+'</div></div>';
    }).join('')||'No times set yet.';
-   document.getElementById('sp-status').textContent=d.running?'A run is in progress...':'';
-  }).catch(function(e){
-   document.getElementById('sp-rows').textContent='Could not load schedules: '+e;});
+   if(d.running) say('A run is in progress...');
+  }).catch(function(){});
 
-  fetch('/api/runs').then(function(r){return r.json()}).then(function(d){
+  call('/api/runs').then(function(d){
    document.getElementById('sp-runs').innerHTML='RECENT RUNS<br>'+
     ((d.runs||[]).map(function(x){
       return new Date(x.started_at).toLocaleString()+' - '+x.trigger+' - '+x.status;
@@ -159,6 +178,7 @@ _INDEX = Path(__file__).parent / "static" / "index.html"
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
+    """Serve the existing dashboard with the schedule panel appended."""
     html = _INDEX.read_text(encoding="utf-8")
     if "sched-fab" not in html:
         html = (html.replace("</body>", PANEL + "</body>", 1)
@@ -166,6 +186,8 @@ def dashboard():
     return HTMLResponse(html)
 
 
+# app.py mounts StaticFiles at "/", which matches every path. Routes added
+# after a mount are shadowed by it, so push all mounts to the end.
 _mounts = [r for r in app.router.routes if isinstance(r, Mount)]
 if _mounts:
     app.router.routes = [r for r in app.router.routes if not isinstance(r, Mount)] + _mounts
