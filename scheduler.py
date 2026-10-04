@@ -4,6 +4,11 @@ scheduler.py — DB-backed schedules triggered from outside the app.
 A Render Free service sleeps after 15 minutes idle, so an in-process
 scheduler cannot fire. GitHub Actions pings /api/cron/tick, which wakes
 the service, and the service asks the database what is due right now.
+
+Each schedule has a mode:
+    search → find new LinkedIn jobs only
+    send   → send mail for pending rows only
+    both   → search, then send
 """
 
 import os
@@ -11,6 +16,7 @@ import secrets
 import threading
 import traceback
 from datetime import datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, HTTPException
@@ -54,6 +60,7 @@ class ScheduleIn(BaseModel):
     label: str = "Run"
     run_at: str
     enabled: bool = True
+    mode: Literal["search", "send", "both"] = "both"
 
     @field_validator("run_at")
     @classmethod
@@ -68,17 +75,17 @@ class ScheduleIn(BaseModel):
         return f"{h:02d}:{m:02d}"
 
 
-def _worker(trigger: str):
+def _worker(trigger: str, mode: str):
     sb = _get_supabase()
     run = None
     try:
         run = sb.table("pipeline_runs").insert(
-            {"trigger": trigger, "status": "running"}).execute().data[0]
+            {"trigger": f"{trigger}:{mode}", "status": "running"}).execute().data[0]
     except Exception as exc:
         print(f"[scheduler] could not log run start: {exc}")
 
     try:
-        _runner(mode) 
+        _runner(mode)
         status, detail = "done", None
     except Exception:
         status, detail = "error", traceback.format_exc()[-4000:]
@@ -87,19 +94,20 @@ def _worker(trigger: str):
     if run:
         try:
             sb.table("pipeline_runs").update({
-                "status": status, "detail": detail,
+                "status": status,
+                "detail": detail,
                 "finished_at": datetime.now(TZ).isoformat(),
             }).eq("id", run["id"]).execute()
         except Exception as exc:
             print(f"[scheduler] could not log run end: {exc}")
 
 
-def start_run(trigger: str) -> bool:
+def start_run(trigger: str, mode: str = "both") -> bool:
     global _thread
     with _lock:
         if is_running():
             return False
-        _thread = threading.Thread(target=_worker, args=(trigger,), daemon=True)
+        _thread = threading.Thread(target=_worker, args=(trigger, mode), daemon=True)
         _thread.start()
         return True
 
@@ -120,6 +128,14 @@ def _due(now: datetime) -> list[dict]:
                 continue
         out.append(row)
     return out
+
+
+def _merge_modes(rows: list[dict]) -> str:
+    """Two slots firing in the same tick: do the union, never the work twice."""
+    modes = {r.get("mode") or "both" for r in rows}
+    if "both" in modes or {"search", "send"} <= modes:
+        return "both"
+    return modes.pop()
 
 
 @router.get("/api/healthz")
@@ -145,7 +161,7 @@ def create_schedule(body: ScheduleIn):
     try:
         resp = sb.table("schedules").insert(payload).execute()
     except Exception as exc:
-        # The usual causes: table missing, or SUPABASE_KEY is the anon key and
+        # Usual causes: table missing, or SUPABASE_KEY is the anon key and
         # row-level security is blocking the write.
         raise HTTPException(500, f"insert failed: {exc}")
 
@@ -153,8 +169,6 @@ def create_schedule(body: ScheduleIn):
     if rows:
         return rows[0]
 
-    # Insert reported success but returned nothing — RLS can do this. Re-read
-    # to find out whether the row actually landed.
     try:
         check = sb.table("schedules").select("*").eq(
             "run_at", payload["run_at"]).execute().data or []
@@ -164,7 +178,7 @@ def create_schedule(body: ScheduleIn):
         return check[-1]
     raise HTTPException(
         500,
-        "insert silently returned no row — this is usually row-level security. "
+        "insert silently returned no row — usually row-level security. "
         "Check that SUPABASE_KEY in Render is the service_role key.",
     )
 
@@ -191,10 +205,12 @@ def delete_schedule(sid: int):
 
 
 @router.post("/api/full-run")
-def full_run_manual():
-    if not start_run("manual"):
+def full_run_manual(mode: str = "both"):
+    if mode not in ("search", "send", "both"):
+        raise HTTPException(422, "mode must be search, send or both")
+    if not start_run("manual", mode):
         raise HTTPException(409, "a run is already in progress")
-    return {"started": True}
+    return {"started": True, "mode": mode}
 
 
 @router.get("/api/runs")
@@ -209,7 +225,6 @@ def recent_runs():
 
 @router.get("/api/schedules/diagnose")
 def diagnose():
-    """Tells you exactly which part of the chain is broken."""
     out = {"timezone": str(TZ), "cron_secret_set": bool(_secret())}
     sb = _sb()
     for table in ("schedules", "pipeline_runs"):
@@ -218,17 +233,6 @@ def diagnose():
             out[table] = {"ok": True, "rows_visible": len(rows or [])}
         except Exception as exc:
             out[table] = {"ok": False, "error": str(exc)}
-    try:
-        probe = sb.table("schedules").insert(
-            {"label": "__probe__", "run_at": "03:33", "enabled": False}).execute()
-        got = probe.data or []
-        out["insert_test"] = {"ok": bool(got), "returned_row": bool(got)}
-        if got:
-            sb.table("schedules").delete().eq("id", got[0]["id"]).execute()
-        else:
-            sb.table("schedules").delete().eq("label", "__probe__").execute()
-    except Exception as exc:
-        out["insert_test"] = {"ok": False, "error": str(exc)}
     return out
 
 
@@ -242,14 +246,17 @@ def cron_tick(x_cron_secret: str = Header(default="")):
     due = _due(now)
     if not due:
         return {"woken": True, "now": now.isoformat(), "fired": []}
-    if not start_run("schedule"):
+
+    mode = _merge_modes(due)
+    if not start_run("schedule", mode):
         return {"woken": True, "fired": [], "note": "already running"}
 
     stamp = now.isoformat()
     for row in due:
         _sb().table("schedules").update(
             {"last_run_at": stamp}).eq("id", row["id"]).execute()
-    return {"woken": True, "now": stamp, "fired": [r["label"] for r in due]}
+    return {"woken": True, "now": stamp, "mode": mode,
+            "fired": [r["label"] for r in due]}
 
 
 PAGE = """<!doctype html>
@@ -258,38 +265,41 @@ PAGE = """<!doctype html>
 <style>
  body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0f1115;color:#ddd;
   margin:0;padding:20px}
- .wrap{max-width:640px;margin:0 auto}
+ .wrap{max-width:660px;margin:0 auto}
  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid #23262b;
   border-radius:8px;padding:10px;margin:8px 0;background:#171a1f}
- input,button{font:inherit;padding:7px 10px;border-radius:6px;border:1px solid #3a3f46;
+ input,button,select{font:inherit;padding:7px 10px;border-radius:6px;border:1px solid #3a3f46;
   background:#1e2127;color:#eee}
  button{cursor:pointer}
  .muted{opacity:.6;font-size:12px}
  h2{color:#f5a524;letter-spacing:.05em}
  a{color:#f5a524}
  @media(max-width:560px){.row{flex-direction:column;align-items:stretch}
-  input{width:100%;box-sizing:border-box}}
+  input,select{width:100%;box-sizing:border-box}}
 </style>
 <div class="wrap">
  <h2>SCHEDULE</h2>
- <p class="muted">Each enabled time runs the full job once a day: LinkedIn search,
- then process and send. <a href="/">Back to dashboard</a></p>
+ <p class="muted">search = find new LinkedIn jobs &middot; send = mail the pending rows
+ &middot; both = search then send. <a href="/">Back to dashboard</a></p>
  <div id="rows"></div>
  <p><button onclick="add()">+ ADD TIME</button>
-    <button onclick="runNow()">RUN NOW</button></p>
+    <button onclick="runNow('search')">SEARCH NOW</button>
+    <button onclick="runNow('send')">SEND NOW</button></p>
  <div id="status" class="muted"></div>
  <h3>Recent runs</h3><div id="runs" class="muted"></div>
 </div>
 <script>
 async function call(u,o){const r=await fetch(u,o);
- if(!r.ok){const t=await r.text();alert('Error '+r.status+': '+t);throw new Error(t);}
- return r.json();}
+ if(!r.ok){const t=await r.text();document.getElementById('status').textContent=
+  'Error '+r.status+': '+t;throw new Error(t);} return r.json();}
+function opt(v,s){return '<option value="'+v+'"'+(s===v?' selected':'')+'>'+v+'</option>';}
 async function load(){
  try{const d=await call('/api/schedules');
   rows.innerHTML=(d.schedules||[]).map(s=>`
    <div class="row" data-sid="${s.id}">
     <input class="l" value="${s.label}">
     <input class="t" type="time" value="${String(s.run_at).slice(0,5)}">
+    <select class="m">${opt('search',s.mode)}${opt('send',s.mode)}${opt('both',s.mode)}</select>
     <label><input class="o" type="checkbox" ${s.enabled?'checked':''}> on</label>
     <button onclick="save(${s.id})">SAVE</button>
     <button onclick="del(${s.id})">DELETE</button>
@@ -303,16 +313,17 @@ async function load(){
  }catch(e){}}
 function body(id){const r=document.querySelector(`[data-sid="${id}"]`);
  return{label:r.querySelector('.l').value.trim()||'Run',
-        run_at:r.querySelector('.t').value,enabled:r.querySelector('.o').checked};}
+        run_at:r.querySelector('.t').value,mode:r.querySelector('.m').value,
+        enabled:r.querySelector('.o').checked};}
 async function save(id){await call('/api/schedules/'+id,{method:'PATCH',
  headers:{'Content-Type':'application/json'},body:JSON.stringify(body(id))});load();}
 async function del(id){if(!confirm('Delete?'))return;
  await call('/api/schedules/'+id,{method:'DELETE'});load();}
 async function add(){await call('/api/schedules',{method:'POST',
  headers:{'Content-Type':'application/json'},
- body:JSON.stringify({label:'New run',run_at:'10:00',enabled:true})});load();}
-async function runNow(){try{await call('/api/full-run',{method:'POST'});
- status.textContent='Started - watch the Console tab.';setTimeout(load,1500);}catch(e){}}
+ body:JSON.stringify({label:'New run',run_at:'10:00',mode:'search',enabled:true})});load();}
+async function runNow(m){try{await call('/api/full-run?mode='+m,{method:'POST'});
+ status.textContent='Started ('+m+') - watch the Console tab.';setTimeout(load,1500);}catch(e){}}
 load();setInterval(load,20000);
 </script>"""
 
