@@ -1,0 +1,28 @@
+name: pipeline-cron
+
+on:
+  schedule:
+    - cron: "0,10 4 * * *"
+    - cron: "0,10 16 * * *"
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the service
+        run: |
+          for i in $(seq 1 12); do
+            if curl -sf -m 30 https://send-auto-mail.onrender.com/api/healthz; then
+              echo "awake"; exit 0
+            fi
+            echo "booting ($i/12)"; sleep 15
+          done
+          echo "service did not wake in 3 minutes"; exit 1
+
+      - name: Tick scheduler
+        run: |
+          curl -sS --fail-with-body -m 900 -X POST \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            https://send-auto-mail.onrender.com/api/cron/tick
