@@ -78,7 +78,7 @@ def _worker(trigger: str):
         print(f"[scheduler] could not log run start: {exc}")
 
     try:
-        _runner()
+        _runner(mode) 
         status, detail = "done", None
     except Exception:
         status, detail = "error", traceback.format_exc()[-4000:]
